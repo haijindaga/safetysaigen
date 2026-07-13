@@ -1,0 +1,9 @@
+# Core framework + 2D simulation (Windows and Ubuntu)
+numpy
+scipy
+opencv-python
+cvxpy
+matplotlib
+pytest
+requests
+pillow
