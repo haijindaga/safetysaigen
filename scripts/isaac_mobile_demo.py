@@ -43,7 +43,9 @@ parser.add_argument("--scene", choices=["plain", "warehouse"], default="plain",
 parser.add_argument("--camera", choices=["own", "jetbot"], default="jetbot",
                     help="jetbot = the robot's built-in camera prim; "
                          "own = create a camera on the chassis")
-parser.add_argument("--steps", type=int, default=3000)
+parser.add_argument("--steps", type=int, default=30000,
+                    help="60 Hz physics steps (30000 = 500 sim-seconds; "
+                         "slow-VLM runs need the first inference to finish)")
 parser.add_argument("--goal", type=float, nargs=2, default=[5.0, 0.0])
 parser.add_argument("--perception-every", type=int, default=30,
                     help="physics steps between perception updates (GT mode)")
