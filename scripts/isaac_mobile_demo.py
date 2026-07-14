@@ -47,6 +47,13 @@ parser.add_argument("--steps", type=int, default=3000)
 parser.add_argument("--goal", type=float, nargs=2, default=[5.0, 0.0])
 parser.add_argument("--perception-every", type=int, default=30,
                     help="physics steps between perception updates (GT mode)")
+parser.add_argument("--no-wait-perception", action="store_true",
+                    help="allow motion before the first barrier is grounded "
+                         "(only sound when v_max satisfies the Theorem-1 "
+                         "certificate for your perception latency)")
+parser.add_argument("--max-barrier-age", type=float, default=0.0,
+                    help="stop if the barrier is older than this many seconds "
+                         "(0 = disabled); stop-start mode for slow perception")
 args = parser.parse_args()
 
 # ---- Isaac boot (must precede any other isaac import) ----------------------
@@ -226,6 +233,7 @@ nominal = WaypointFollower([tuple(args.goal)], v_max=V_MAX, omega_max=OMEGA_MAX)
 _lock = threading.Lock()
 _latest = {}          # frame handed to the worker
 _busy = threading.Event()
+_state = {"last_perception": None}   # wall time of last completed cycle
 
 
 DEBUG_DIR = Path("results/isaac_debug")
@@ -268,6 +276,7 @@ def _perception_worker():
                 frame["rgb"], frame["depth"], frame["pose"],
                 visible_classes=frame["classes"],
                 instance_counts=frame["counts"])
+            _state["last_perception"] = _time.time()
             print(f"[perception] cycle {_time.time()-t0:.1f}s")
             _dump_debug(frame)
         except Exception as e:      # keep last good barrier on any failure
@@ -311,6 +320,16 @@ try:
             _busy.set()
 
     u_nom = nominal.compute(base.state)
+    # Safe initialization: no motion until the first barrier is grounded
+    # (Assumption 1). With slow perception, --max-barrier-age also enforces
+    # the paper's stop-start regime instead of the continuous-motion
+    # certificate, which our CPU-VLM latency cannot satisfy at this v_max.
+    import time as _time
+    if pipeline.barrier is None and not args.no_wait_perception:
+        u_nom = np.zeros(3)
+    elif (args.max_barrier_age > 0 and _state["last_perception"] is not None
+          and _time.time() - _state["last_perception"] > args.max_barrier_age):
+        u_nom = np.zeros(3)
     u_safe = pipeline.safe_control(u_nom, base)
     u_safe = base.clip_input(u_safe)
     action = diff_controller.forward(command=[float(u_safe[0]), float(u_safe[2])])
