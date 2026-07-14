@@ -38,12 +38,17 @@ class OllamaVLM(VLMClient):
 
     def __init__(self, model: str = "gemma3:27b",
                  host: str = "http://localhost:11434",
-                 timeout: float = 300.0,
-                 temperature: float = 0.0):
+                 timeout: float = 600.0,
+                 temperature: float = 0.0,
+                 num_gpu: int | None = None):
+        """num_gpu: Ollama option = number of layers offloaded to the GPU.
+        Pass 0 to run the model CPU-only — required when the GPU is shared
+        with Isaac Sim / SAM3 on an 8 GB card. None = server default."""
         self.model = model
         self.host = host.rstrip("/")
         self.timeout = timeout
         self.temperature = temperature
+        self.num_gpu = num_gpu
         self.last_latency: float | None = None
         self.last_raw: str | None = None
 
@@ -56,10 +61,13 @@ class OllamaVLM(VLMClient):
 
     def infer(self, rgb: np.ndarray, visible_classes: list[str] | None = None) -> SafetyConstraints:
         import requests
+        options: dict = {"temperature": self.temperature}
+        if self.num_gpu is not None:
+            options["num_gpu"] = self.num_gpu
         payload = {
             "model": self.model,
             "stream": False,
-            "options": {"temperature": self.temperature},
+            "options": options,
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user",

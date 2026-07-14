@@ -33,6 +33,9 @@ parser.add_argument("--headless", action="store_true")
 parser.add_argument("--vlm", choices=["rulebook", "ollama"], default="rulebook")
 parser.add_argument("--segmenter", choices=["gt", "sam3"], default="gt")
 parser.add_argument("--ollama-model", default="gemma3:27b")
+parser.add_argument("--ollama-num-gpu", type=int, default=0,
+                    help="Ollama GPU layers; 0 = CPU-only (default: the GPU "
+                         "is needed by Isaac/SAM3 on an 8 GB card)")
 parser.add_argument("--steps", type=int, default=3000)
 parser.add_argument("--goal", type=float, nargs=2, default=[5.0, 0.0])
 parser.add_argument("--perception-every", type=int, default=30,
@@ -144,7 +147,7 @@ cfg = CoreConfig(min_range=0.4, max_range=6.0,     # Jetbot-scale (paper: 3-7 m)
                  perception_period=1)              # we gate perception ourselves
 
 if args.vlm == "ollama":
-    vlm = OllamaVLM(model=args.ollama_model)
+    vlm = OllamaVLM(model=args.ollama_model, num_gpu=args.ollama_num_gpu)
 else:
     vlm = RuleBasedVLM(DEFAULT_RULEBOOK, contextual=True)
 
@@ -193,8 +196,12 @@ threading.Thread(target=_perception_worker, daemon=True).start()
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
+import os
+import traceback
+
 step = 0
-while simulation_app.is_running() and step < args.steps:
+try:
+  while simulation_app.is_running() and step < args.steps:
     pos, quat = robot.get_world_pose()
     base.update_pose(pos, quat)
 
@@ -235,7 +242,13 @@ while simulation_app.is_running() and step < args.steps:
             print("reached goal")
             break
     step += 1
+  print("done — robot should be stopped at the cone line, not past it "
+        "(cones are at x=3.0).")
+except Exception:
+    traceback.print_exc()   # show the real error before Isaac teardown noise
 
-print("done — robot should be stopped at the cone line, not past it "
-      "(cones are at x=3.0).")
+# Isaac Sim is known to segfault in omni.graph/syntheticdata teardown during
+# interpreter finalization (harmless but alarming). Close the app, then skip
+# the remaining atexit handlers.
 simulation_app.close()
+os._exit(0)

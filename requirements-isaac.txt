@@ -1,0 +1,14 @@
+# Dependencies to add to the Isaac Sim conda env (env_isaaclab).
+# CRITICAL: Isaac Sim 5.x pins numpy==1.26.0 and osqp==0.6.7.post3.
+# Never let pip upgrade numpy here — omni.graph breaks with numpy 2.x
+# ("Unable to write from unknown dtype").
+#
+#   conda activate env_isaaclab
+#   pip install -r requirements-isaac.txt
+numpy==1.26.0
+osqp==0.6.7.post3
+opencv-python==4.10.0.84   # 4.x line: compatible with numpy 1.26
+cvxpy==1.5.3               # last line compatible with numpy 1.26 + osqp 0.6.x
+scipy
+requests
+pillow

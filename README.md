@@ -104,4 +104,7 @@ python scripts/eval_vlm_ollama.py --data assets/vlm_eval --model gemma3:27b --sm
 - [x] Phase 0: コアライブラリ + ユニットテスト (Windows)
 - [x] Phase 1: 2D 閉ループ再現実験 (Windows)
 - [x] Phase 2: Ollama VLM 評価スクリプト + SAM3 アダプタ (Ubuntu で実行)
-- [ ] Phase 3: Isaac Sim 統合 (env_isaaclab): 移動ロボット → 四足 → モバイルマニピュレータ
+- [x] Phase 3a: Isaac Sim 移動ロボット (Jetbot) — 動作確認済み
+- [ ] Phase 3b: 四足 (Spot 歩行ポリシー) — `scripts/isaac_quadruped_demo.py`
+- [ ] Phase 3c: モバイルマニピュレータ (Ridgeback+Franka, 実験的) — `scripts/isaac_manipulator_demo.py`
+- [ ] フルスタック (--vlm ollama --segmenter sam3) の実測と速度証明書 (`scripts/compute_certificate.py`)
