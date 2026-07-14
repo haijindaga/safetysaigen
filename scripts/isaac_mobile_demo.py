@@ -173,6 +173,31 @@ _latest = {}          # frame handed to the worker
 _busy = threading.Event()
 
 
+DEBUG_DIR = Path("results/isaac_debug")
+DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _dump_debug(frame):
+    """Save RGB, VLM output, and mask overlay for offline inspection."""
+    import time as _time
+    import cv2
+    ts = _time.strftime("%H%M%S")
+    cv2.imwrite(str(DEBUG_DIR / f"{ts}_rgb.png"), frame["rgb"][:, :, ::-1])
+    c = pipeline.debug.constraints
+    txt = "no constraints" if c is None else (
+        f"logic: {c.safety_logic}\nclasses: {c.classes}\n"
+        f"safe: {[str(p) for p in c.safe]}\nunsafe: {[str(p) for p in c.unsafe]}\n"
+        f"raw:\n{getattr(vlm, 'last_raw', '')}")
+    (DEBUG_DIR / f"{ts}_vlm.txt").write_text(txt)
+    if pipeline.debug.unsafe_mask is not None:
+        ov = frame["rgb"].copy()
+        ov[pipeline.debug.safe_mask] = (0.5 * ov[pipeline.debug.safe_mask]
+                                        + [0, 120, 0]).astype("uint8")
+        ov[pipeline.debug.unsafe_mask] = (0.5 * ov[pipeline.debug.unsafe_mask]
+                                          + [120, 0, 0]).astype("uint8")
+        cv2.imwrite(str(DEBUG_DIR / f"{ts}_masks.png"), ov[:, :, ::-1])
+
+
 def _perception_worker():
     while simulation_app.is_running():
         _busy.wait(timeout=0.5)
@@ -181,11 +206,15 @@ def _perception_worker():
         with _lock:
             frame = dict(_latest)
         try:
+            import time as _time
+            t0 = _time.time()
             gt_segmenter.update(frame["labels"], frame["id_to_name"])
             pipeline.update_perception(
                 frame["rgb"], frame["depth"], frame["pose"],
                 visible_classes=frame["classes"],
                 instance_counts=frame["counts"])
+            print(f"[perception] cycle {_time.time()-t0:.1f}s")
+            _dump_debug(frame)
         except Exception as e:      # keep last good barrier on any failure
             print(f"[perception] update failed: {e}")
         _busy.clear()
