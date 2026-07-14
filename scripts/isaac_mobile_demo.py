@@ -36,6 +36,13 @@ parser.add_argument("--ollama-model", default="gemma3:27b")
 parser.add_argument("--ollama-num-gpu", type=int, default=0,
                     help="Ollama GPU layers; 0 = CPU-only (default: the GPU "
                          "is needed by Isaac/SAM3 on an 8 GB card)")
+parser.add_argument("--scene", choices=["plain", "warehouse"], default="plain",
+                    help="plain = gray ground + primitive cones; warehouse = "
+                         "photoreal Isaac warehouse + real cone props "
+                         "(use for real VLM/SAM3)")
+parser.add_argument("--camera", choices=["own", "jetbot"], default="jetbot",
+                    help="jetbot = the robot's built-in camera prim; "
+                         "own = create a camera on the chassis")
 parser.add_argument("--steps", type=int, default=3000)
 parser.add_argument("--goal", type=float, nargs=2, default=[5.0, 0.0])
 parser.add_argument("--perception-every", type=int, default=30,
@@ -86,17 +93,60 @@ CAM_RES = (500, 320)                 # (width, height), matches 2D sim scale
 # ---------------------------------------------------------------------------
 # Scene
 # ---------------------------------------------------------------------------
+import omni.client
+from isaacsim.core.utils.stage import add_reference_to_stage
+
 world = World(stage_units_in_meters=1.0, physics_dt=PHYSICS_DT,
               rendering_dt=PHYSICS_DT)
-ground = world.scene.add_default_ground_plane()
-add_update_semantics(get_prim_at_path("/World/defaultGroundPlane"), "floor")
 
-for i, y in enumerate(np.linspace(-1.2, 1.2, 5)):
-    cone = world.scene.add(FixedCylinder(
-        prim_path=f"/World/cone_{i}", name=f"cone_{i}",
-        position=np.array([3.0, float(y), 0.2]),
-        radius=0.08, height=0.4, color=np.array([1.0, 0.4, 0.0])))
-    add_update_semantics(cone.prim, "cone")
+
+def _find_cone_prop(assets_root: str) -> str | None:
+    """Search warehouse prop folders for a traffic-cone USD."""
+    for folder in ("/Isaac/Environments/Simple_Warehouse/Props",
+                   "/Isaac/Props/Warehouse", "/Isaac/Props"):
+        result, entries = omni.client.list(assets_root + folder)
+        if result != omni.client.Result.OK:
+            continue
+        for e in entries:
+            name = e.relative_path
+            if "cone" in name.lower() and name.lower().endswith(
+                    (".usd", ".usda", ".usdz")):
+                return assets_root + folder + "/" + name
+    return None
+
+
+if args.scene == "warehouse":
+    from isaacsim.storage.native import get_assets_root_path as _garp
+    _assets = _garp()
+    add_reference_to_stage(
+        usd_path=_assets + "/Isaac/Environments/Simple_Warehouse/warehouse.usd",
+        prim_path="/World/warehouse")
+    cone_usd = _find_cone_prop(_assets)
+    print(f"[scene] warehouse loaded; cone prop: {cone_usd}")
+    for i, y in enumerate(np.linspace(-1.2, 1.2, 5)):
+        if cone_usd:
+            add_reference_to_stage(usd_path=cone_usd,
+                                   prim_path=f"/World/cone_{i}")
+            prim = get_prim_at_path(f"/World/cone_{i}")
+            from isaacsim.core.prims import XFormPrim as _X
+            _X(f"/World/cone_{i}").set_world_poses(
+                positions=np.array([[3.0, float(y), 0.0]]))
+        else:
+            world.scene.add(FixedCylinder(
+                prim_path=f"/World/cone_{i}", name=f"cone_{i}",
+                position=np.array([3.0, float(y), 0.2]),
+                radius=0.08, height=0.4, color=np.array([1.0, 0.4, 0.0])))
+            prim = get_prim_at_path(f"/World/cone_{i}")
+        add_update_semantics(prim, "cone")
+else:
+    ground = world.scene.add_default_ground_plane()
+    add_update_semantics(get_prim_at_path("/World/defaultGroundPlane"), "floor")
+    for i, y in enumerate(np.linspace(-1.2, 1.2, 5)):
+        cone = world.scene.add(FixedCylinder(
+            prim_path=f"/World/cone_{i}", name=f"cone_{i}",
+            position=np.array([3.0, float(y), 0.2]),
+            radius=0.08, height=0.4, color=np.array([1.0, 0.4, 0.0])))
+        add_update_semantics(cone.prim, "cone")
 
 # Goal marker (visual only, no semantics -> invisible to the safety stack)
 world.scene.add(VisualCuboid(prim_path="/World/goal", name="goal",
@@ -126,13 +176,18 @@ robot = world.scene.add(WheeledRobot(
 diff_controller = DifferentialController(name="diff", wheel_radius=0.03,
                                          wheel_base=0.1125)
 
-# Orientation uses the wrapper's world-axes convention (x-forward); identity
-# means "look along the chassis +x". If the image comes out pointing down or
-# rotated on your Isaac version, adjust this quaternion.
-camera = Camera(prim_path="/World/jetbot/chassis/core_cam",
-                translation=np.array([0.08, 0.0, 0.25]),
-                orientation=np.array([1.0, 0.0, 0.0, 0.0]),
-                resolution=CAM_RES, frequency=20)
+JETBOT_CAM_PRIM = "/World/jetbot/chassis/rgb_camera/jetbot_camera"
+if args.camera == "jetbot" and get_prim_at_path(JETBOT_CAM_PRIM).IsValid():
+    # Wrap the robot's built-in camera (already positioned/oriented).
+    camera = Camera(prim_path=JETBOT_CAM_PRIM, resolution=CAM_RES)
+    print("[camera] using jetbot built-in camera")
+else:
+    # Own camera; identity orientation = look along chassis +x (world axes).
+    camera = Camera(prim_path="/World/jetbot/chassis/core_cam",
+                    translation=np.array([0.08, 0.0, 0.25]),
+                    orientation=np.array([1.0, 0.0, 0.0, 0.0]),
+                    resolution=CAM_RES, frequency=20)
+    print("[camera] using created core_cam")
 
 world.reset()
 camera.initialize()
