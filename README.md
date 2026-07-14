@@ -1,8 +1,6 @@
-# core-safety — CORE 再現実装
+# core-safety
 
-論文 **"Contextual Safety Reasoning and Grounding for Open-World Robots"**
-(Ravichandran et al., arXiv:2602.19983) の CORE フレームワークの再現実装。
-
+文脈依存のロボット安全フレームワークの実装。
 事前の地図・安全仕様なしで、文脈依存の安全性を **推論 (VLM) → 接地 (セグメンテーション+空間オペレータ+コストマップ) → 強制 (CBF-QP)** の3段で実現する。
 CBF は平面速度指令 `(vx, vy, ω)` に作用するため、移動ロボット・四足・モバイルマニピュレータで共通に使える。
 
@@ -13,7 +11,7 @@ core_safety/
   predicates.py        述語 ON/NEAR/AROUND/BETWEEN と VLM JSON パーサ
   pipeline.py          3モジュールを束ねるオーケストレータ
   reasoning/
-    prompt.py          論文 Listing 1 の VLM システムプロンプト (忠実再現)
+    prompt.py          VLM システムプロンプト (参照手法の Listing 1 準拠)
     vlm_client.py      OllamaVLM (gemma3:27b) / RuleBasedVLM (開発・ベースライン用)
   grounding/
     segmentation.py    Segmenter IF + 真値セグメンタ (2D sim / Isaac GT 用)
@@ -49,7 +47,7 @@ pytest tests/ -q
 Ubuntu で VLM / SAM3 を使う場合は追加で:
 
 ```bash
-pip install torch --index-url https://download.pytorch.org/whl/cu121
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 pip install -r requirements-ubuntu.txt   # transformers (SAM3), accelerate
 ```
 
@@ -70,9 +68,9 @@ python scripts/eval_baselines.py --repeats 5
 python scripts/eval_vlm_ollama.py --data assets/vlm_eval --model gemma3:27b --smoke
 ```
 
-## 論文との対応
+## 参照手法との対応
 
-| 論文 | 本実装 |
+| 参照手法 | 本実装 |
 |---|---|
 | VLM: 4bit Gemma 3 27B on Ollama | `OllamaVLM("gemma3:27b")` (同一構成) |
 | プロンプト (Listing 1) | `reasoning/prompt.py` (逐語) |

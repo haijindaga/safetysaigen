@@ -10,8 +10,15 @@ cd core-safety
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-pytest tests/ -q          # 24 passed になること
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest tests/ -q   # 24 passed になること
 ```
+
+**pytest が ROS の import エラーで落ちる場合**: `.bashrc` で ROS Humble を
+source していると venv 内にも ROS のパッケージが見え、pytest が ROS の
+`launch_testing` プラグインを自動ロードしようとして `No module named 'yaml'`
+で失敗する。上記のように `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1` を付けるか、
+`pip install pyyaml` で回避できる (どちらでもよい)。
+pytest 以外のスクリプトはこの影響を受けない。
 
 ## 2. 2D シミュレーション動作確認 (GPU 不要)
 
@@ -45,8 +52,23 @@ python scripts/eval_vlm_ollama.py --data assets/vlm_eval --model gemma3:27b
 
 ## 4. SAM3 (GPU)
 
+**事前準備 (初回のみ)**: facebook/sam3 は gated モデルなので、
+① HuggingFace アカウントでログインし、
+② https://huggingface.co/facebook/sam3 で利用条件に同意
+   ("Agree and access repository")、
+③ https://huggingface.co/settings/tokens で Read トークンを作成し、
+④ Ubuntu 側で認証する:
+
 ```bash
-pip install torch --index-url https://download.pytorch.org/whl/cu121
+pip install -U "huggingface_hub[cli]"
+hf auth login                    # 旧版: huggingface-cli login
+# または実行時のみ: export HF_TOKEN=hf_xxxxxxxx
+```
+
+その後:
+
+```bash
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 pip install -r requirements-ubuntu.txt
 python scripts/test_sam3.py     # 合成画像で SAM3Segmenter の自己診断
 ```

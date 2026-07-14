@@ -1,7 +1,4 @@
-"""CORE: Contextual Safety Reasoning and Enforcement.
-
-Reproduction of "Contextual Safety Reasoning and Grounding for Open-World
-Robots" (Ravichandran et al., arXiv:2602.19983).
+"""Contextual safety reasoning and enforcement framework.
 
 Three modules:
   - reasoning:  VLM-based contextual safety constraint inference

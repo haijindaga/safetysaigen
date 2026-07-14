@@ -1,8 +1,56 @@
-# Phase 3: Isaac Sim 統合設計 (env_isaaclab)
+# Phase 3: Isaac Sim 統合 (env_isaaclab)
 
-まだ実装していない。ここでは接続点と手順だけ固定する。
+第一弾を実装済み: `scripts/isaac_mobile_demo.py` (Jetbot + コーン列)。
+実行方法:
+
+```bash
+conda activate env_isaaclab
+cd core-safety
+pip install -r requirements.txt          # 初回のみ (torch には触れない)
+export PYTHONPATH=$PWD:$PYTHONPATH
+python scripts/isaac_mobile_demo.py                  # GT セグ + ルールブック推論
+python scripts/isaac_mobile_demo.py --vlm ollama     # 実 VLM (非同期スレッド)
+python scripts/isaac_mobile_demo.py --segmenter sam3 # 実 SAM3
+python scripts/isaac_mobile_demo.py --headless       # GUI なし
+```
+
+期待挙動: 名目制御はゴール (x=5) へ直進しようとするが、コーン列 (x=3) の
+手前でフィルタが停止させる (ログの `filtered=True`, `h` が 0 付近で停止)。
+
+**注意 (未検証コード)**: このスクリプトは Windows 側では実行確認できない。
+Isaac Sim はバージョンごとに API 名が変わるため (4.5 で omni.isaac.* →
+isaacsim.* に改称)、両系統の import フォールバックを入れてあるが、
+手元のバージョンで import エラーが出たら、そのモジュール名だけ読み替えて
+ほしい (エラーメッセージのモジュール名を `docs.isaacsim.omniverse.nvidia.com`
+の該当バージョンの API リファレンスで引くのが早い)。
+Jetbot の USD パスも 5.x (`/Isaac/Robots/NVIDIA/Jetbot/jetbot.usd`) と
+4.x (`/Isaac/Robots/Jetbot/jetbot.usd`) で異なる — スクリプト冒頭の候補を
+入れ替えれば対応できる。
+
 CORE 側のインターフェースは 2D シミュレータと完全に同じなので、
-Isaac 側は「RGB-D + ポーズを渡し、速度指令を受け取る」ブリッジを書くだけ。
+Isaac 側は「RGB-D + ポーズを渡し、速度指令を受け取る」ブリッジだけである
+(`core_safety/isaac/adapter.py` は純 Python で、Windows のユニットテスト対象)。
+
+## 環境について (venv と conda の使い分け)
+
+- Phase 1–2 (2D sim / VLM 評価 / SAM3 単体) はプロジェクトの `.venv` で完結。
+- Phase 3 のブリッジスクリプトは Isaac の Python 内で動くため、
+  **conda の env_isaaclab に CORE の依存を追加**する:
+
+```bash
+conda activate env_isaaclab
+cd core-safety
+pip install -r requirements.txt      # torch は含まない (既存の CUDA torch を保護)
+export PYTHONPATH=$PWD:$PYTHONPATH   # core_safety を import 可能に
+# SAM3 を Isaac と同一プロセスで使う場合のみ:
+pip install "transformers>=5.0" accelerate
+```
+
+- Ollama (VLM) は HTTP 経由の別プロセスなので環境の影響を受けない。
+- 万一 Isaac Lab のピン留めと cvxpy 等が衝突したら、知覚+CBF を
+  `.venv` 側の別プロセスに置き、Isaac とは ZMQ / ROS2 で
+  画像・ポーズ⇄速度指令だけ交換する構成に切り替える
+  (CORE 側インターフェースは不変)。
 
 ## 接続点 (これだけ実装すればよい)
 

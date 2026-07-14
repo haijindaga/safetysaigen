@@ -1,0 +1,3 @@
+# Isaac Sim bridge. Import submodules explicitly on the Ubuntu machine:
+#   from core_safety.isaac.adapter import IsaacPlanarBase, ...
+# (No eager imports here so the rest of the package stays usable without Isaac.)

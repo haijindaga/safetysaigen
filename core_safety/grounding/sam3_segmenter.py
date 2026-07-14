@@ -4,7 +4,7 @@ Uses HuggingFace transformers' SAM3 (Promptable Concept Segmentation):
 text prompt per semantic class -> union of instance masks for that class.
 
 Install (Ubuntu, inside the project venv):
-    pip install "transformers>=5.0" torch --index-url https://download.pytorch.org/whl/cu121
+    pip install "transformers>=5.0" torch torchvision --index-url https://download.pytorch.org/whl/cu121
     # weights auto-download from facebook/sam3 on first use (~3.4 GB)
 
 Notes for the RTX 4060 (8 GB):
