@@ -18,7 +18,8 @@ from .predicates import SafetyConstraints
 from .reasoning.vlm_client import VLMClient
 from .grounding.segmentation import Segmenter
 from .grounding.image_safe_set import build_image_safe_set
-from .grounding.projection import PinholeCamera, project_masks_to_world
+from .grounding.projection import (PinholeCamera, pixels_to_world,
+                                   project_masks_to_world)
 from .grounding.costmap import SemanticCostmap
 from .grounding.barrier import SDFBarrier
 from .control.cbf_qp import CBFSafetyFilter
@@ -36,6 +37,9 @@ class CoreConfig:
                                      # (kills wall-ghost obstacles)
     costmap_decay: float = 1.0       # <1 forgets old votes each update
                                      # (stale ghosts fade as views change)
+    geometric_layer: bool = False    # also mark ANY above-floor depth point
+                                     # unsafe (walls/objects the VLM did not
+                                     # name still enter the barrier)
     v_max: float = 0.35
     omega_max: float = 1.0
     perception_period: int = 10     # control steps between perception updates
@@ -68,6 +72,7 @@ class CorePipeline:
         self.filter = CBFSafetyFilter(self.cfg.alpha_gain,
                                       self.cfg.v_max, self.cfg.omega_max)
         self.debug = CoreDebug()
+        self.known_classes: set[str] = set()   # every class the VLM ever named
         self._step = 0
 
     # ---- monitoring layer: SAM3 + depth only (~1 Hz, no VLM) -------------
@@ -79,18 +84,33 @@ class CorePipeline:
         constraints = self.debug.constraints
         if constraints is None:
             return 1.0                       # nothing known yet: max novelty
-        seg = self.segmenter.segment(rgb, constraints.all_classes())
+        self.known_classes |= set(constraints.all_classes())
+        seg = self.segmenter.segment(rgb, sorted(self.known_classes))
         if not seg:
             return self.debug.novelty
-        # Novelty: in-range pixels not explained by any known class.
+        # Novelty is defined AGAINST THE MAP, not per frame: an observation
+        # is novel only if no known class explains it AND it lands in cells
+        # the map has never seen. A static wall is novel exactly once.
         explained = np.zeros(depth.shape, dtype=bool)
         for m in seg.values():
             explained |= m
         candidate = (np.isfinite(depth) & (depth >= self.cfg.min_range)
                      & (depth <= self.cfg.max_range))
-        n_cand = int(candidate.sum())
-        if n_cand > 0:
-            self.debug.novelty = float((candidate & ~explained).sum()) / n_cand
+        unexplained = candidate & ~explained
+        novelty = 0.0
+        if unexplained.any():
+            pts = pixels_to_world(self.camera, depth, unexplained, robot_pose,
+                                  self.cfg.min_range, self.cfg.max_range,
+                                  self.cfg.max_height)
+            if len(pts):
+                cm = self.costmap
+                ix = np.clip(((pts[:, 0] - cm.x_min) / cm.res).astype(int),
+                             0, cm.nx - 1)
+                iy = np.clip(((pts[:, 1] - cm.y_min) / cm.res).astype(int),
+                             0, cm.ny - 1)
+                unseen = (cm.n_safe[ix, iy] + cm.n_unsafe[ix, iy]) == 0
+                novelty = float(unseen.mean())
+        self.debug.novelty = novelty
         self._ground(constraints, seg, depth, robot_pose)
         return self.debug.novelty
 
@@ -138,6 +158,7 @@ class CorePipeline:
                       f"{e} (first attempt: {first_err})")
                 return
         self.debug.constraints = constraints
+        self.known_classes |= set(constraints.all_classes())
 
         seg = self.segmenter.segment(rgb, constraints.all_classes())
         if not seg:
@@ -156,6 +177,19 @@ class CorePipeline:
             self.camera, depth, safe_mask, unsafe_mask, robot_pose,
             self.cfg.min_range, self.cfg.max_range, self.cfg.pixel_stride,
             self.cfg.max_height)
+        if self.cfg.geometric_layer:
+            cam = self.camera
+            vv = np.arange(depth.shape[0], dtype=float)[:, None]
+            z_px = cam.mount_height - depth * (vv - cam.cy) / cam.fy
+            geom = (np.isfinite(depth) & (depth >= self.cfg.min_range)
+                    & (depth <= self.cfg.max_range) & (z_px > 0.10)
+                    & (z_px <= (self.cfg.max_height or 1.5)))
+            sub = np.zeros_like(geom)
+            sub[::self.cfg.pixel_stride, ::self.cfg.pixel_stride] = True
+            geom_pts = pixels_to_world(cam, depth, geom & sub, robot_pose,
+                                       self.cfg.min_range, self.cfg.max_range)
+            unsafe_pts = (np.vstack([unsafe_pts, geom_pts])
+                          if len(unsafe_pts) else geom_pts)
         self.costmap.add_points(safe_pts, unsafe_pts)
         if len(unsafe_pts):
             r = np.linalg.norm(unsafe_pts - np.asarray(robot_pose[:2]), axis=1)
