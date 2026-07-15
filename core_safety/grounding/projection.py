@@ -52,9 +52,11 @@ def pixels_to_world(cam: PinholeCamera, depth: np.ndarray, mask: np.ndarray,
     u, v, d = u[valid], v[valid], d[valid]
     if max_height is not None and len(u):
         # Height above ground for a horizontal camera: mount_height - y_cam
-        # (camera y points down; y_cam = d (v - cy) / fy).
+        # (camera y points down; y_cam = d (v - cy) / fy). Keep a band
+        # around the ground: above kills wall ghosts, below kills garbage
+        # depth from invalid (black) image regions near the clip plane.
         z_world = cam.mount_height - d * (v - cam.cy) / cam.fy
-        keep = z_world <= max_height
+        keep = (z_world <= max_height) & (z_world >= -0.25)
         u, v, d = u[keep], v[keep], d[keep]
     if len(u) == 0:
         return np.zeros((0, 2))
