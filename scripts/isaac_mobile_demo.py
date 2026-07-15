@@ -94,6 +94,7 @@ from core_safety.isaac.adapter import (IsaacPlanarBase, camera_from_intrinsics,
                                        parse_semantic_frame)
 from core_safety.pipeline import CorePipeline, CoreConfig
 from core_safety.reasoning.vlm_client import RuleBasedVLM, OllamaVLM, DEFAULT_RULEBOOK
+from core_safety.telemetry import TelemetryWriter
 
 PHYSICS_DT = 1.0 / 60.0
 V_MAX, OMEGA_MAX = 0.3, 1.0          # Jetbot-scale limits
@@ -241,6 +242,7 @@ _state = {"last_perception": None}   # wall time of last completed cycle
 DEBUG_DIR = Path("results/isaac_debug").resolve()
 DEBUG_DIR.mkdir(parents=True, exist_ok=True)
 print(f"[debug] artifacts will be written to: {DEBUG_DIR}")
+telemetry = TelemetryWriter(DEBUG_DIR)
 
 
 def _dump_debug(frame):
@@ -307,7 +309,8 @@ def _perception_worker():
                 visible_classes=frame["classes"],
                 instance_counts=frame["counts"])
             _state["last_perception"] = _time.time()
-            print(f"[perception] cycle {_time.time()-t0:.1f}s")
+            _state["cycle_s"] = _time.time() - t0
+            print(f"[perception] cycle {_state['cycle_s']:.1f}s")
             _dump_debug(frame)
         except Exception as e:      # keep last good barrier on any failure
             print(f"[perception] update failed: {e}")
@@ -371,6 +374,25 @@ try:
         print(f"t={step*PHYSICS_DT:5.1f}s pos=({base.state[0]:+.2f},"
               f"{base.state[1]:+.2f}) h={pipeline.debug.h:6.2f} "
               f"filtered={pipeline.debug.filtered} d_goal={d_goal:.2f}")
+        # Dashboard hook (optional viewer; harmless if nothing reads it).
+        telemetry.write_status(
+            t=step * PHYSICS_DT, x=float(base.state[0]), y=float(base.state[1]),
+            h=(None if not np.isfinite(pipeline.debug.h) else float(pipeline.debug.h)),
+            filtered=bool(pipeline.debug.filtered), d_goal=d_goal,
+            cycle_s=_state.get("cycle_s"), vlm=args.vlm,
+            model=(args.ollama_model if args.vlm == "ollama" else "-"),
+            segmenter=args.segmenter, v_max=base.v_max,
+            max_barrier_age=args.max_barrier_age,
+            perception_every=args.perception_every)
+        p = telemetry.read_params()
+        if "v_max" in p:
+            base.v_max = nominal.v_max = float(p["v_max"])
+        if "max_barrier_age" in p:
+            args.max_barrier_age = float(p["max_barrier_age"])
+        if "perception_every" in p:
+            args.perception_every = max(1, int(p["perception_every"]))
+        if "tau" in p:
+            pipeline.costmap.tau = float(p["tau"])
         if d_goal < 0.25:
             print("reached goal")
             break
