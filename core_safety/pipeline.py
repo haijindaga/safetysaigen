@@ -157,6 +157,10 @@ class CorePipeline:
             self.cfg.min_range, self.cfg.max_range, self.cfg.pixel_stride,
             self.cfg.max_height)
         self.costmap.add_points(safe_pts, unsafe_pts)
+        if len(unsafe_pts):
+            r = np.linalg.norm(unsafe_pts - np.asarray(robot_pose[:2]), axis=1)
+            print(f"[ground] unsafe votes n={len(unsafe_pts)} at "
+                  f"{r.min():.2f}-{r.max():.2f} m (median {np.median(r):.2f})")
         self.barrier = SDFBarrier(self.costmap.safe_grid(),
                                   self.costmap.x_min, self.costmap.y_min,
                                   self.costmap.res)

@@ -40,9 +40,11 @@ parser.add_argument("--scene", choices=["plain", "warehouse"], default="plain",
                     help="plain = gray ground + primitive cones; warehouse = "
                          "photoreal Isaac warehouse + real cone props "
                          "(use for real VLM/SAM3)")
-parser.add_argument("--camera", choices=["own", "jetbot"], default="jetbot",
-                    help="jetbot = the robot's built-in camera prim; "
-                         "own = create a camera on the chassis")
+parser.add_argument("--camera", choices=["own", "jetbot"], default="own",
+                    help="own (default) = a camera we fully control (0.28 m, "
+                         "standard FOV, verifiable); jetbot = the built-in "
+                         "6 cm 160-deg fisheye (faithful to the real robot "
+                         "but geometry-poor for 3-7 m grounding)")
 parser.add_argument("--steps", type=int, default=30000,
                     help="60 Hz physics steps (30000 = 500 sim-seconds; "
                          "slow-VLM runs need the first inference to finish)")
@@ -251,8 +253,13 @@ if args.segmenter == "sam3":
 else:
     segmenter = gt_segmenter
 
+try:      # actual optical height above ground (jetbot cam is ~0.1 m)
+    _cam_h = float(camera.get_world_pose()[0][2])
+except Exception:
+    _cam_h = 0.25
+print(f"[camera] optical height above ground: {_cam_h:.3f} m")
 pin_cam = camera_from_intrinsics(camera.get_intrinsics_matrix(),
-                                 CAM_RES[0], CAM_RES[1], mount_height=0.25)
+                                 CAM_RES[0], CAM_RES[1], mount_height=_cam_h)
 pipeline = CorePipeline(vlm, segmenter, pin_cam,
                         workspace=(-2.0, 8.0, -4.0, 4.0), config=cfg)
 
