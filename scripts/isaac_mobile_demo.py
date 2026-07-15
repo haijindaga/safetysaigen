@@ -341,10 +341,31 @@ try:
     if step % args.perception_every == 0 and not _busy.is_set():
         frame = camera.get_current_frame()
         rgba = frame.get("rgba")
+        if rgba is None or np.asarray(rgba).size <= 1:
+            rgba = frame.get("rgb")            # key name differs by version
+        if rgba is None or np.asarray(rgba).size <= 1:
+            try:
+                rgba = camera.get_rgba()       # direct API fallback
+            except Exception:
+                rgba = None
         depth = frame.get("distance_to_image_plane")
         sem = frame.get("semantic_segmentation")
-        if rgba is not None and depth is not None and sem is not None \
-                and np.asarray(depth).size > 1:
+        ok = (rgba is not None and np.asarray(rgba).size > 1
+              and depth is not None and np.asarray(depth).size > 1
+              and sem is not None)
+        if not ok and step % 300 == 0:
+            def _d(x):
+                return "None" if x is None else str(np.asarray(x).shape)
+            print(f"[perception] waiting for camera data: "
+                  f"frame_keys={list(frame.keys())} rgba={_d(rgba)} "
+                  f"depth={_d(depth)} sem={'None' if sem is None else 'ok'}")
+        if ok:
+            rgba = np.asarray(rgba)
+            if rgba.ndim == 3 and rgba.shape[2] >= 3:
+                pass
+            else:
+                ok = False
+        if ok:
             labels, id_to_name = parse_semantic_frame(sem)
             present = [id_to_name[i] for i in np.unique(labels)
                        if i in id_to_name and id_to_name[i] not in
