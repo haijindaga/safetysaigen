@@ -67,6 +67,17 @@ parser.add_argument("--novelty-threshold", type=float, default=0.35,
                          "pixels that triggers a VLM call")
 parser.add_argument("--vlm-max-interval", type=float, default=60.0,
                     help="extended mode: force a VLM call at least this often [s]")
+parser.add_argument("--nominal", choices=["straight", "astar"],
+                    default="straight",
+                    help="nominal controller: straight-line waypoint P-control "
+                         "(paper-style) or A* replanning on the costmap so "
+                         "the robot routes around grounded constraints")
+parser.add_argument("--mission", default="",
+                    help="natural-language task passed to the VLM as context, "
+                         "e.g. 'reach the green marker about 5 m ahead'")
+parser.add_argument("--estop-dist", type=float, default=0.35,
+                    help="depth reflex layer: cut forward motion when any "
+                         "central depth pixel is closer than this [m]; 0=off")
 args = parser.parse_args()
 
 # ---- Isaac boot (must precede any other isaac import) ----------------------
@@ -100,6 +111,7 @@ except ImportError:  # pre-4.5 namespaces
 import numpy as np
 
 from core_safety.control.nominal import WaypointFollower
+from core_safety.control.planner import plan_path
 from core_safety.grounding.segmentation import GroundTruthSegmenter
 from core_safety.isaac.adapter import (IsaacPlanarBase, camera_from_intrinsics,
                                        parse_semantic_frame)
@@ -407,6 +419,13 @@ try:
             present = [id_to_name[i] for i in np.unique(labels)
                        if i in id_to_name and id_to_name[i] not in
                        ("background", "unlabelled", "unlabeled")]
+            # Reflex layer: min depth in the central forward window. Covers
+            # the projection dead zone closer than CoreConfig.min_range.
+            d_arr = np.asarray(depth, dtype=float)
+            hgt, wdt = d_arr.shape[:2]
+            win = d_arr[hgt // 3: (2 * hgt) // 3, wdt // 3: (2 * wdt) // 3]
+            finite = win[np.isfinite(win) & (win > 0.02)]
+            _state["front_min"] = float(finite.min()) if finite.size else 99.0
             # Decide which layer runs: the VLM (thinking layer) only when
             # triggered; otherwise SAM3+depth keep the map fresh.
             import time as _t
@@ -426,6 +445,8 @@ try:
                 if job == "vlm":
                     d_goal = float(np.linalg.norm(
                         base.state[:2] - np.asarray(args.goal)))
+                    mission = (f"MISSION: {args.mission}. "
+                               if args.mission else "")
                     brg = np.degrees(
                         np.arctan2(args.goal[1] - base.state[1],
                                    args.goal[0] - base.state[0])
@@ -433,7 +454,8 @@ try:
                     fr = pipeline.nearest_frontier(base.state[0], base.state[1])
                     fr_txt = ("none mapped yet" if fr is None else
                               f"{np.linalg.norm(fr - base.state[:2]):.1f} m away")
-                    context = (f"goal {d_goal:.1f} m at bearing {brg:+.0f} deg; "
+                    context = (mission +
+                               f"goal {d_goal:.1f} m at bearing {brg:+.0f} deg; "
                                f"unexplained visual novelty "
                                f"{pipeline.debug.novelty:.0%}; "
                                f"robot currently blocked by safety filter: "
@@ -452,6 +474,14 @@ try:
 
     import time as _time
     _now = _time.time()
+    # ---- nominal planner: A* replanning on the costmap -------------------
+    if (args.nominal == "astar" and step % 120 == 0
+            and pipeline.barrier is not None):
+        path = plan_path(pipeline.costmap,
+                         (base.state[0], base.state[1]), tuple(args.goal))
+        if path:
+            nominal = WaypointFollower(path, v_max=cfg.v_max,
+                                       omega_max=cfg.omega_max)
     # ---- behavior executor (extended reasoning) --------------------------
     if args.reasoning == "extended" and _state.pop("new_vlm", False):
         c = pipeline.debug.constraints
@@ -500,6 +530,10 @@ try:
             u_nom = u_nom * 0.5
     u_safe = pipeline.safe_control(u_nom, base)
     u_safe = base.clip_input(u_safe)
+    # Reflex layer: something inside the projection dead zone -> no forward.
+    if (args.estop_dist > 0 and u_safe[0] > 0
+            and _state.get("front_min", 99.0) < args.estop_dist):
+        u_safe = np.array([0.0, u_safe[1], u_safe[2]])
     # Stuck = filter active and no translation for a sustained period.
     if pipeline.debug.filtered and float(np.linalg.norm(u_safe[:2])) < 0.02:
         if _state["stuck_since"] is None:
@@ -525,6 +559,8 @@ try:
             filtered=bool(pipeline.debug.filtered), d_goal=d_goal,
             cycle_s=_state.get("cycle_s"), vlm=args.vlm,
             reasoning=args.reasoning, behavior=_state["behavior"],
+            planner=args.nominal,
+            front_min=round(_state.get("front_min", 99.0), 2),
             novelty=round(pipeline.debug.novelty, 3),
             vlm_message=_state["vlm_message"],
             model=(args.ollama_model if args.vlm == "ollama" else "-"),
