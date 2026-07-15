@@ -302,7 +302,14 @@ def _perception_worker():
             frame = dict(_latest)
         try:
             import time as _time
+            import cv2
             t0 = _time.time()
+            # Save the camera input immediately, before the (possibly slow /
+            # hanging) VLM call, so the dashboard always shows what we see.
+            cv2.imwrite(str(DEBUG_DIR / "latest_rgb.png"),
+                        np.ascontiguousarray(frame["rgb"][:, :, ::-1]))
+            print("[perception] cycle starting (VLM inference; first call "
+                  "also loads the model)...")
             gt_segmenter.update(frame["labels"], frame["id_to_name"])
             pipeline.update_perception(
                 frame["rgb"], frame["depth"], frame["pose"],

@@ -76,11 +76,13 @@ class CorePipeline:
             if instance_counts is not None:
                 kwargs["instance_counts"] = instance_counts
             constraints = self.vlm.infer(rgb, visible_classes=visible_classes, **kwargs)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError) as first_err:
             try:
                 constraints = self.vlm.infer(rgb, visible_classes=visible_classes)
-            except ValueError:
+            except ValueError as e:
                 # Reasoning failure (invalid VLM output): keep previous barrier.
+                print(f"[pipeline] VLM output unusable, keeping old barrier: "
+                      f"{e} (first attempt: {first_err})")
                 return
         self.debug.constraints = constraints
 

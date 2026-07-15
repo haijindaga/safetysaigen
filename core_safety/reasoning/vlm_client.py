@@ -59,7 +59,8 @@ class OllamaVLM(VLMClient):
         Image.fromarray(rgb).save(buf, format="PNG")
         return base64.b64encode(buf.getvalue()).decode()
 
-    def infer(self, rgb: np.ndarray, visible_classes: list[str] | None = None) -> SafetyConstraints:
+    def infer(self, rgb: np.ndarray, visible_classes: list[str] | None = None,
+              **_ignored) -> SafetyConstraints:
         import requests
         options: dict = {"temperature": self.temperature}
         if self.num_gpu is not None:
