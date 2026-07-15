@@ -314,6 +314,16 @@ def _dump_debug(frame):
     except Exception as e:
         print(f"[debug] mask save failed: {e}")
     try:
+        # Depth as the robot sees it (colormapped, 0-6 m).
+        d = frame.get("depth")
+        if d is not None:
+            dv = np.clip(np.nan_to_num(np.asarray(d), nan=6.0, posinf=6.0)
+                         / 6.0 * 255.0, 0, 255).astype(np.uint8)
+            cv2.imwrite(str(DEBUG_DIR / f"{ts}_depth.png"),
+                        cv2.applyColorMap(dv, cv2.COLORMAP_TURBO))
+    except Exception as e:
+        print(f"[debug] depth save failed: {e}")
+    try:
         # Top-down costmap: what the barrier actually enforces right now.
         cm = pipeline.costmap
         img = np.full((cm.ny, cm.nx, 3), 128, dtype=np.uint8)   # gray unknown
@@ -419,13 +429,31 @@ try:
             present = [id_to_name[i] for i in np.unique(labels)
                        if i in id_to_name and id_to_name[i] not in
                        ("background", "unlabelled", "unlabeled")]
-            # Reflex layer: min depth in the central forward window. Covers
-            # the projection dead zone closer than CoreConfig.min_range.
+            # Reflex layer: nearest ABOVE-FLOOR point ahead. Height-gate the
+            # pixels so the floor itself (visible from a 10 cm camera) can
+            # never trigger the e-stop; covers the projection dead zone.
             d_arr = np.asarray(depth, dtype=float)
             hgt, wdt = d_arr.shape[:2]
-            win = d_arr[hgt // 3: (2 * hgt) // 3, wdt // 3: (2 * wdt) // 3]
-            finite = win[np.isfinite(win) & (win > 0.02)]
-            _state["front_min"] = float(finite.min()) if finite.size else 99.0
+            vv = np.arange(hgt, dtype=float)[:, None]
+            z_px = (pipeline.camera.mount_height
+                    - d_arr * (vv - pipeline.camera.cy) / pipeline.camera.fy)
+            obst = (np.isfinite(d_arr) & (d_arr > 0.02)
+                    & (z_px > 0.05) & (z_px < 0.6))
+            obst[:, : wdt // 4] = False        # central half of the image
+            obst[:, (3 * wdt) // 4:] = False
+            _state["front_min"] = (float(d_arr[obst].min())
+                                   if obst.any() else 99.0)
+            if not _state.get("diag_printed"):
+                _state["diag_printed"] = True
+                fin = d_arr[np.isfinite(d_arr) & (d_arr > 0)]
+                q = (np.percentile(fin, [5, 50, 95]).round(2).tolist()
+                     if fin.size else [])
+                print(f"[diag] rgb={np.asarray(rgba).shape} depth={d_arr.shape}"
+                      f" intrinsics: fx={pipeline.camera.fx:.1f}"
+                      f" fy={pipeline.camera.fy:.1f} cx={pipeline.camera.cx:.1f}"
+                      f" cy={pipeline.camera.cy:.1f}"
+                      f" cam_size=({pipeline.camera.width},{pipeline.camera.height})"
+                      f" depth[m] p5/50/95={q}")
             # Decide which layer runs: the VLM (thinking layer) only when
             # triggered; otherwise SAM3+depth keep the map fresh.
             import time as _t
