@@ -35,15 +35,27 @@ class PinholeCamera:
 
 def pixels_to_world(cam: PinholeCamera, depth: np.ndarray, mask: np.ndarray,
                     robot_pose: np.ndarray,
-                    min_range: float = 3.0, max_range: float = 7.0) -> np.ndarray:
+                    min_range: float = 3.0, max_range: float = 7.0,
+                    max_height: float | None = None) -> np.ndarray:
     """Project masked pixels with registered depth into world XY.
 
     robot_pose: (x, y, theta). Returns Nx2 array of world (x, y).
+
+    max_height: if set, discard pixels whose 3D point lies higher than this
+    above the ground. Mask pixels on walls/background (e.g. from AROUND
+    dilation spilling past an object silhouette) carry the wall's depth and
+    would otherwise project as ghost obstacles far behind the object.
     """
     v, u = np.nonzero(mask)
     d = depth[v, u]
     valid = np.isfinite(d) & (d >= min_range) & (d <= max_range)
     u, v, d = u[valid], v[valid], d[valid]
+    if max_height is not None and len(u):
+        # Height above ground for a horizontal camera: mount_height - y_cam
+        # (camera y points down; y_cam = d (v - cy) / fy).
+        z_world = cam.mount_height - d * (v - cam.cy) / cam.fy
+        keep = z_world <= max_height
+        u, v, d = u[keep], v[keep], d[keep]
     if len(u) == 0:
         return np.zeros((0, 2))
 
@@ -65,13 +77,17 @@ def project_masks_to_world(cam: PinholeCamera, depth: np.ndarray,
                            safe_mask: np.ndarray, unsafe_mask: np.ndarray,
                            robot_pose: np.ndarray,
                            min_range: float = 3.0, max_range: float = 7.0,
-                           stride: int = 2) -> tuple[np.ndarray, np.ndarray]:
+                           stride: int = 2,
+                           max_height: float | None = None
+                           ) -> tuple[np.ndarray, np.ndarray]:
     """Project both partitions; stride subsamples pixels for speed."""
     if stride > 1:
         sub = np.zeros_like(safe_mask)
         sub[::stride, ::stride] = True
         safe_mask = safe_mask & sub
         unsafe_mask = unsafe_mask & sub
-    safe_pts = pixels_to_world(cam, depth, safe_mask, robot_pose, min_range, max_range)
-    unsafe_pts = pixels_to_world(cam, depth, unsafe_mask, robot_pose, min_range, max_range)
+    safe_pts = pixels_to_world(cam, depth, safe_mask, robot_pose,
+                               min_range, max_range, max_height)
+    unsafe_pts = pixels_to_world(cam, depth, unsafe_mask, robot_pose,
+                                 min_range, max_range, max_height)
     return safe_pts, unsafe_pts

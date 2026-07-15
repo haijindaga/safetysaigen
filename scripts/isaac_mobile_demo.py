@@ -208,6 +208,7 @@ camera.add_semantic_segmentation_to_frame()
 # CORE pipeline
 # ---------------------------------------------------------------------------
 cfg = CoreConfig(min_range=0.4, max_range=6.0,     # Jetbot-scale (paper: 3-7 m)
+                 max_height=0.6,                   # drop wall-pixel ghosts
                  v_max=V_MAX, omega_max=OMEGA_MAX,
                  perception_period=1)              # we gate perception ourselves
 

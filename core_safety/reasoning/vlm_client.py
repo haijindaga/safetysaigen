@@ -78,7 +78,8 @@ class OllamaVLM(VLMClient):
         }
         t0 = time.time()
         r = requests.post(f"{self.host}/api/chat", json=payload, timeout=self.timeout)
-        r.raise_for_status()
+        if r.status_code >= 400:
+            raise RuntimeError(f"Ollama HTTP {r.status_code}: {r.text[:300]}")
         self.last_latency = time.time() - t0
         self.last_raw = r.json()["message"]["content"]
         return parse_vlm_output(self.last_raw)

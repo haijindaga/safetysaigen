@@ -32,6 +32,8 @@ class CoreConfig:
     around_kernel_px: int = 50      # AROUND dilation kernel
     min_range: float = 3.0          # depth clip [m] (paper: 3-7 m)
     max_range: float = 7.0
+    max_height: float | None = None  # drop projected points above this [m]
+                                     # (kills wall-ghost obstacles)
     v_max: float = 0.35
     omega_max: float = 1.0
     perception_period: int = 10     # control steps between perception updates
@@ -95,7 +97,8 @@ class CorePipeline:
 
         safe_pts, unsafe_pts = project_masks_to_world(
             self.camera, depth, safe_mask, unsafe_mask, robot_pose,
-            self.cfg.min_range, self.cfg.max_range, self.cfg.pixel_stride)
+            self.cfg.min_range, self.cfg.max_range, self.cfg.pixel_stride,
+            self.cfg.max_height)
         self.costmap.add_points(safe_pts, unsafe_pts)
         self.barrier = SDFBarrier(self.costmap.safe_grid(),
                                   self.costmap.x_min, self.costmap.y_min,
