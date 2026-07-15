@@ -77,6 +77,9 @@ parser.add_argument("--nominal", choices=["straight", "astar"],
 parser.add_argument("--mission", default="",
                     help="natural-language task passed to the VLM as context, "
                          "e.g. 'reach the green marker about 5 m ahead'")
+parser.add_argument("--cam-fov", type=float, default=90.0,
+                    help="own camera: horizontal field of view in degrees "
+                         "(0 = leave the asset default ~50 deg)")
 parser.add_argument("--estop-dist", type=float, default=0.35,
                     help="depth reflex layer: cut forward motion when any "
                          "central depth pixel is closer than this [m]; 0=off")
@@ -226,6 +229,13 @@ else:
 
 world.reset()
 camera.initialize()
+if args.cam_fov > 0 and args.camera == "own":
+    try:      # widen the FOV: focal = aperture / (2 tan(fov/2))
+        ap = float(camera.get_horizontal_aperture())
+        camera.set_focal_length(ap / (2 * np.tan(np.radians(args.cam_fov) / 2)))
+        print(f"[camera] horizontal FOV set to {args.cam_fov:.0f} deg")
+    except Exception as e:
+        print(f"[camera] FOV change failed (using default): {e}")
 camera.add_distance_to_image_plane_to_frame()
 camera.add_semantic_segmentation_to_frame()
 
