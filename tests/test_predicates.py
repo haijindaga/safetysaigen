@@ -34,3 +34,18 @@ def test_parse_vlm_output_with_fences_and_trailing_comma():
 def test_parse_vlm_output_invalid_raises():
     with pytest.raises(ValueError):
         parse_vlm_output("I think the floor is safe to traverse.")
+
+
+def test_parse_behavior_fields():
+    text = """{
+    "safety_logic": "x", "classes": "cone",
+    "unsafe_regions": "NEAR(cone)", "safe_regions": "",
+    "behavior": "investigate", "behavior_reason": "occluded area ahead",
+    "message": "may I proceed?"
+    }"""
+    c = parse_vlm_output(text)
+    assert c.behavior == "INVESTIGATE"
+    assert c.message == "may I proceed?"
+    # Unknown behavior degrades to None, never crashes.
+    c2 = parse_vlm_output('{"behavior": "FLY", "classes": ""}')
+    assert c2.behavior is None

@@ -40,7 +40,8 @@ class OllamaVLM(VLMClient):
                  host: str = "http://localhost:11434",
                  timeout: float = 600.0,
                  temperature: float = 0.0,
-                 num_gpu: int | None = None):
+                 num_gpu: int | None = None,
+                 system_prompt: str | None = None):
         """num_gpu: Ollama option = number of layers offloaded to the GPU.
         Pass 0 to run the model CPU-only — required when the GPU is shared
         with Isaac Sim / SAM3 on an 8 GB card. None = server default."""
@@ -49,6 +50,7 @@ class OllamaVLM(VLMClient):
         self.timeout = timeout
         self.temperature = temperature
         self.num_gpu = num_gpu
+        self.system_prompt = system_prompt or SYSTEM_PROMPT
         self.last_latency: float | None = None
         self.last_raw: str | None = None
 
@@ -60,19 +62,21 @@ class OllamaVLM(VLMClient):
         return base64.b64encode(buf.getvalue()).decode()
 
     def infer(self, rgb: np.ndarray, visible_classes: list[str] | None = None,
-              **_ignored) -> SafetyConstraints:
+              context: str | None = None, **_ignored) -> SafetyConstraints:
         import requests
         options: dict = {"temperature": self.temperature}
         if self.num_gpu is not None:
             options["num_gpu"] = self.num_gpu
+        user = "Analyze this image and output the safety JSON."
+        if context:
+            user += f"\nMAP CONTEXT: {context}"
         payload = {
             "model": self.model,
             "stream": False,
             "options": options,
             "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user",
-                 "content": "Analyze this image and output the safety JSON.",
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user", "content": user,
                  "images": [self._encode_image(rgb)]},
             ],
         }
@@ -118,7 +122,8 @@ class RuleBasedVLM(VLMClient):
         self.min_between_instances = min_between_instances
 
     def infer(self, rgb: np.ndarray, visible_classes: list[str] | None = None,
-              instance_counts: dict[str, int] | None = None) -> SafetyConstraints:
+              instance_counts: dict[str, int] | None = None,
+              **_ignored) -> SafetyConstraints:
         if visible_classes is None:
             raise ValueError("RuleBasedVLM requires ground-truth visible_classes")
         rb = self.rulebook

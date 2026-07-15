@@ -29,6 +29,9 @@ class Predicate:
         return f"{self.op}({self.cls})"
 
 
+BEHAVIORS = ("PROCEED", "SLOW", "STOP_AND_SCAN", "INVESTIGATE", "ASK_HUMAN")
+
+
 @dataclass
 class SafetyConstraints:
     """Structured output of the contextual safety reasoning module."""
@@ -36,6 +39,10 @@ class SafetyConstraints:
     classes: list[str] = field(default_factory=list)
     unsafe: list[Predicate] = field(default_factory=list)
     safe: list[Predicate] = field(default_factory=list)
+    # Extended-reasoning fields (None in faithful mode):
+    behavior: str | None = None          # one of BEHAVIORS
+    behavior_reason: str = ""
+    message: str = ""                    # question/report for the human
 
     def all_classes(self) -> list[str]:
         """Classes referenced anywhere (for the segmentation front-end)."""
@@ -76,9 +83,15 @@ def parse_vlm_output(text: str) -> SafetyConstraints:
     else:
         classes = [str(c) for c in classes_field]
 
+    behavior = str(obj.get("behavior", "")).strip().upper() or None
+    if behavior is not None and behavior not in BEHAVIORS:
+        behavior = None
     return SafetyConstraints(
         safety_logic=str(obj.get("safety_logic", "")),
         classes=classes,
         unsafe=parse_predicates(str(obj.get("unsafe_regions", ""))),
         safe=parse_predicates(str(obj.get("safe_regions", ""))),
+        behavior=behavior,
+        behavior_reason=str(obj.get("behavior_reason", "")),
+        message=str(obj.get("message", "")),
     )

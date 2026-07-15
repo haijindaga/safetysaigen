@@ -61,3 +61,27 @@ Output a **Single Valid JSON Object**.
 "safe_regions": "ON(class_d), BETWEEN(class_a)",
 }
 </instructions>"""
+
+# Extended mode: same safety predicates, plus an explicit behavior decision.
+# The user message additionally carries a MAP CONTEXT line summarizing what
+# the robot's map knows (unobserved regions, stuck state, goal direction).
+EXTENDED_PROMPT = SYSTEM_PROMPT.replace("</instructions>", """
+### 4. BEHAVIOR DECISION
+You will also receive a "MAP CONTEXT" line describing the robot's map:
+unobserved or occluded regions, whether the robot is currently blocked,
+and where its goal lies. Using the image AND the map context, choose the
+robot's next behavior:
+- "PROCEED": the scene is understood; continuing toward the goal is safe.
+- "SLOW": somewhat uncertain; continue but at reduced speed.
+- "STOP_AND_SCAN": stop and rotate in place to look around before moving.
+- "INVESTIGATE": there is an unobserved/occluded area that matters (e.g.
+  space hidden behind objects, beyond a doorway). Move to observe it FROM
+  A SAFE DISTANCE before committing to a path.
+- "ASK_HUMAN": the situation needs human confirmation; put a short
+  question in "message".
+
+Add these keys to the SAME flat JSON object:
+"behavior": "PROCEED",
+"behavior_reason": "one sentence on why",
+"message": ""
+</instructions>""")

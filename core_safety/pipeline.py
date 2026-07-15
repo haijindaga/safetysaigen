@@ -49,6 +49,7 @@ class CoreDebug:
     unsafe_mask: np.ndarray | None = None
     h: float = np.inf
     filtered: bool = False
+    novelty: float = 0.0     # fraction of in-range pixels no known class explains
     history: list = field(default_factory=list)
 
 
@@ -69,14 +70,62 @@ class CorePipeline:
         self.debug = CoreDebug()
         self._step = 0
 
+    # ---- monitoring layer: SAM3 + depth only (~1 Hz, no VLM) -------------
+    def update_grounding(self, rgb: np.ndarray, depth: np.ndarray,
+                         robot_pose: np.ndarray) -> float:
+        """Re-ground the LAST known constraints on a fresh frame and update
+        the novelty score. Cheap enough to run continuously; the VLM is only
+        needed when this layer flags something it cannot explain."""
+        constraints = self.debug.constraints
+        if constraints is None:
+            return 1.0                       # nothing known yet: max novelty
+        seg = self.segmenter.segment(rgb, constraints.all_classes())
+        if not seg:
+            return self.debug.novelty
+        # Novelty: in-range pixels not explained by any known class.
+        explained = np.zeros(depth.shape, dtype=bool)
+        for m in seg.values():
+            explained |= m
+        candidate = (np.isfinite(depth) & (depth >= self.cfg.min_range)
+                     & (depth <= self.cfg.max_range))
+        n_cand = int(candidate.sum())
+        if n_cand > 0:
+            self.debug.novelty = float((candidate & ~explained).sum()) / n_cand
+        self._ground(constraints, seg, depth, robot_pose)
+        return self.debug.novelty
+
+    def nearest_frontier(self, x: float, y: float,
+                         max_dist: float = 5.0) -> np.ndarray | None:
+        """World position of the nearest safe cell that borders unobserved
+        space (a candidate vantage point for INVESTIGATE)."""
+        cm = self.costmap
+        observed = (cm.n_safe + cm.n_unsafe) > 0
+        safe = cm.safe_grid() & observed
+        pad = np.pad(observed, 1, constant_values=False)
+        near_unobs = ~(pad[:-2, 1:-1] & pad[2:, 1:-1]
+                       & pad[1:-1, :-2] & pad[1:-1, 2:])
+        frontier = safe & near_unobs
+        idx = np.argwhere(frontier)
+        if len(idx) == 0:
+            return None
+        xs, ys = cm.cell_centers()
+        pts = np.stack([xs[idx[:, 0]], ys[idx[:, 1]]], axis=1)
+        d = np.linalg.norm(pts - np.array([x, y]), axis=1)
+        keep = (d > 0.5) & (d <= max_dist)
+        if not keep.any():
+            return None
+        pts, d = pts[keep], d[keep]
+        return pts[int(np.argmin(d))]
+
     # ---- perception (slow outer loop) ------------------------------------
     def update_perception(self, rgb: np.ndarray, depth: np.ndarray,
                           robot_pose: np.ndarray,
                           visible_classes: list[str] | None = None,
-                          instance_counts: dict[str, int] | None = None):
+                          instance_counts: dict[str, int] | None = None,
+                          context: str | None = None):
         """Run reasoning + grounding on one RGB-D frame, refresh the barrier."""
         try:
-            kwargs = {}
+            kwargs = {"context": context} if context else {}
             if instance_counts is not None:
                 kwargs["instance_counts"] = instance_counts
             constraints = self.vlm.infer(rgb, visible_classes=visible_classes, **kwargs)
@@ -93,6 +142,9 @@ class CorePipeline:
         seg = self.segmenter.segment(rgb, constraints.all_classes())
         if not seg:
             return
+        self._ground(constraints, seg, depth, robot_pose)
+
+    def _ground(self, constraints, seg, depth, robot_pose):
         safe_mask, unsafe_mask = build_image_safe_set(
             constraints, seg, self.cfg.around_kernel_px)
         self.debug.safe_mask, self.debug.unsafe_mask = safe_mask, unsafe_mask

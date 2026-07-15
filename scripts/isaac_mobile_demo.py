@@ -56,6 +56,17 @@ parser.add_argument("--no-wait-perception", action="store_true",
 parser.add_argument("--max-barrier-age", type=float, default=0.0,
                     help="stop if the barrier is older than this many seconds "
                          "(0 = disabled); stop-start mode for slow perception")
+parser.add_argument("--reasoning", choices=["faithful", "extended"],
+                    default="faithful",
+                    help="faithful = paper prompt, VLM every cycle; "
+                         "extended = event-driven VLM with behavior decisions "
+                         "(PROCEED/SLOW/STOP_AND_SCAN/INVESTIGATE/ASK_HUMAN); "
+                         "SAM3+depth keep grounding between VLM calls")
+parser.add_argument("--novelty-threshold", type=float, default=0.35,
+                    help="extended mode: fraction of unexplained in-range "
+                         "pixels that triggers a VLM call")
+parser.add_argument("--vlm-max-interval", type=float, default=60.0,
+                    help="extended mode: force a VLM call at least this often [s]")
 args = parser.parse_args()
 
 # ---- Isaac boot (must precede any other isaac import) ----------------------
@@ -212,8 +223,12 @@ cfg = CoreConfig(min_range=0.4, max_range=6.0,     # Jetbot-scale (paper: 3-7 m)
                  v_max=V_MAX, omega_max=OMEGA_MAX,
                  perception_period=1)              # we gate perception ourselves
 
+from core_safety.reasoning.prompt import EXTENDED_PROMPT
+
 if args.vlm == "ollama":
-    vlm = OllamaVLM(model=args.ollama_model, num_gpu=args.ollama_num_gpu)
+    vlm = OllamaVLM(model=args.ollama_model, num_gpu=args.ollama_num_gpu,
+                    system_prompt=(EXTENDED_PROMPT if args.reasoning == "extended"
+                                   else None))
 else:
     vlm = RuleBasedVLM(DEFAULT_RULEBOOK, contextual=True)
 
@@ -237,7 +252,12 @@ nominal = WaypointFollower([tuple(args.goal)], v_max=V_MAX, omega_max=OMEGA_MAX)
 _lock = threading.Lock()
 _latest = {}          # frame handed to the worker
 _busy = threading.Event()
-_state = {"last_perception": None}   # wall time of last completed cycle
+_state = {"last_perception": None,   # wall time of last completed cycle
+          "last_vlm": None, "new_vlm": False, "stuck_since": None,
+          "behavior": "-", "vlm_message": ""}
+# Behavior-executor modifiers (extended reasoning mode).
+_mode = {"scan_until": 0.0, "slow_until": 0.0, "ask_until": 0.0,
+         "invest": None, "invest_until": 0.0}
 
 
 import time as _boot_time
@@ -315,16 +335,25 @@ def _perception_worker():
             # hanging) VLM call, so the dashboard always shows what we see.
             cv2.imwrite(str(DEBUG_DIR / "latest_rgb.png"),
                         np.ascontiguousarray(frame["rgb"][:, :, ::-1]))
-            print("[perception] cycle starting (VLM inference; first call "
-                  "also loads the model)...")
             gt_segmenter.update(frame["labels"], frame["id_to_name"])
-            pipeline.update_perception(
-                frame["rgb"], frame["depth"], frame["pose"],
-                visible_classes=frame["classes"],
-                instance_counts=frame["counts"])
-            _state["last_perception"] = _time.time()
-            _state["cycle_s"] = _time.time() - t0
-            print(f"[perception] cycle {_state['cycle_s']:.1f}s")
+            if frame.get("job") == "ground":
+                pipeline.update_grounding(frame["rgb"], frame["depth"],
+                                          frame["pose"])
+                _state["last_perception"] = _time.time()
+                print(f"[ground] cycle {_time.time()-t0:.1f}s "
+                      f"novelty={pipeline.debug.novelty:.2f}")
+            else:
+                print("[perception] VLM cycle starting...")
+                pipeline.update_perception(
+                    frame["rgb"], frame["depth"], frame["pose"],
+                    visible_classes=frame["classes"],
+                    instance_counts=frame["counts"],
+                    context=frame.get("context"))
+                _state["last_perception"] = _time.time()
+                _state["last_vlm"] = _time.time()
+                _state["new_vlm"] = True
+                _state["cycle_s"] = _time.time() - t0
+                print(f"[perception] cycle {_state['cycle_s']:.1f}s")
             _dump_debug(frame)
         except Exception as e:      # keep last good barrier on any failure
             print(f"[perception] update failed: {e}")
@@ -378,6 +407,38 @@ try:
             present = [id_to_name[i] for i in np.unique(labels)
                        if i in id_to_name and id_to_name[i] not in
                        ("background", "unlabelled", "unlabeled")]
+            # Decide which layer runs: the VLM (thinking layer) only when
+            # triggered; otherwise SAM3+depth keep the map fresh.
+            import time as _t
+            _now = _t.time()
+            job, context = "vlm", None
+            if args.reasoning == "extended":
+                have_c = pipeline.debug.constraints is not None
+                since_vlm = (_now - _state["last_vlm"]
+                             if _state["last_vlm"] else 1e9)
+                stuck = (_state["stuck_since"] is not None
+                         and _now - _state["stuck_since"] > 8.0)
+                trigger = (not have_c
+                           or pipeline.debug.novelty > args.novelty_threshold
+                           or since_vlm > args.vlm_max_interval
+                           or stuck)
+                job = "vlm" if trigger else "ground"
+                if job == "vlm":
+                    d_goal = float(np.linalg.norm(
+                        base.state[:2] - np.asarray(args.goal)))
+                    brg = np.degrees(
+                        np.arctan2(args.goal[1] - base.state[1],
+                                   args.goal[0] - base.state[0])
+                        - base.state[2])
+                    fr = pipeline.nearest_frontier(base.state[0], base.state[1])
+                    fr_txt = ("none mapped yet" if fr is None else
+                              f"{np.linalg.norm(fr - base.state[:2]):.1f} m away")
+                    context = (f"goal {d_goal:.1f} m at bearing {brg:+.0f} deg; "
+                               f"unexplained visual novelty "
+                               f"{pipeline.debug.novelty:.0%}; "
+                               f"robot currently blocked by safety filter: "
+                               f"{stuck}; nearest boundary of unobserved "
+                               f"space: {fr_txt}.")
             with _lock:
                 _latest.update(
                     rgb=np.asarray(rgba)[:, :, :3].copy(),
@@ -385,22 +446,66 @@ try:
                     labels=labels, id_to_name=id_to_name,
                     classes=present,
                     counts={"cone": 5},
-                    pose=base.state.copy())
+                    pose=base.state.copy(),
+                    job=job, context=context)
             _busy.set()
 
-    u_nom = nominal.compute(base.state)
+    import time as _time
+    _now = _time.time()
+    # ---- behavior executor (extended reasoning) --------------------------
+    if args.reasoning == "extended" and _state.pop("new_vlm", False):
+        c = pipeline.debug.constraints
+        b = (c.behavior if c else None) or "PROCEED"
+        _mode.update(scan_until=0.0, slow_until=0.0, ask_until=0.0)
+        if b == "SLOW":
+            _mode["slow_until"] = _now + args.vlm_max_interval
+        elif b == "STOP_AND_SCAN":
+            _mode["scan_until"] = _now + 2 * np.pi / 0.5   # one full turn
+        elif b == "INVESTIGATE":
+            wp = pipeline.nearest_frontier(base.state[0], base.state[1])
+            if wp is not None:
+                _mode["invest"] = WaypointFollower(
+                    [tuple(wp)], v_max=cfg.v_max, omega_max=cfg.omega_max)
+                _mode["invest_until"] = _now + 30.0
+        elif b == "ASK_HUMAN":
+            _mode["ask_until"] = _now + 30.0
+        _state["behavior"] = b
+        _state["vlm_message"] = getattr(c, "message", "") or ""
+        print(f"[behavior] {b} — {getattr(c, 'behavior_reason', '')} "
+              f"{('MSG: ' + _state['vlm_message']) if _state['vlm_message'] else ''}")
+    inv = _mode.get("invest")
+    if inv is not None and (inv.done or _now > _mode["invest_until"]):
+        _mode["invest"] = None
+        inv = None
+
+    u_nom = inv.compute(base.state) if inv is not None \
+        else nominal.compute(base.state)
     # Safe initialization: no motion until the first barrier is grounded
     # (Assumption 1). With slow perception, --max-barrier-age also enforces
     # the paper's stop-start regime instead of the continuous-motion
     # certificate, which our CPU-VLM latency cannot satisfy at this v_max.
-    import time as _time
     if pipeline.barrier is None and not args.no_wait_perception:
         u_nom = np.zeros(3)
     elif (args.max_barrier_age > 0 and _state["last_perception"] is not None
           and _time.time() - _state["last_perception"] > args.max_barrier_age):
         u_nom = np.zeros(3)
+    # Behavior overrides: rotation-in-place is translation-free (safe even
+    # pre-barrier); ASK_HUMAN holds still; SLOW halves whatever remains.
+    if args.reasoning == "extended":
+        if _now < _mode["scan_until"]:
+            u_nom = np.array([0.0, 0.0, 0.5])
+        elif _now < _mode["ask_until"]:
+            u_nom = np.zeros(3)
+        elif _now < _mode["slow_until"]:
+            u_nom = u_nom * 0.5
     u_safe = pipeline.safe_control(u_nom, base)
     u_safe = base.clip_input(u_safe)
+    # Stuck = filter active and no translation for a sustained period.
+    if pipeline.debug.filtered and float(np.linalg.norm(u_safe[:2])) < 0.02:
+        if _state["stuck_since"] is None:
+            _state["stuck_since"] = _now
+    else:
+        _state["stuck_since"] = None
     action = diff_controller.forward(command=[float(u_safe[0]), float(u_safe[2])])
     robot.apply_wheel_actions(action)
 
@@ -419,6 +524,9 @@ try:
             h=(None if not np.isfinite(pipeline.debug.h) else float(pipeline.debug.h)),
             filtered=bool(pipeline.debug.filtered), d_goal=d_goal,
             cycle_s=_state.get("cycle_s"), vlm=args.vlm,
+            reasoning=args.reasoning, behavior=_state["behavior"],
+            novelty=round(pipeline.debug.novelty, 3),
+            vlm_message=_state["vlm_message"],
             model=(args.ollama_model if args.vlm == "ollama" else "-"),
             segmenter=args.segmenter, v_max=base.v_max,
             max_barrier_age=args.max_barrier_age,
