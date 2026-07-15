@@ -304,6 +304,7 @@ def _perception_worker():
             import time as _time
             import cv2
             t0 = _time.time()
+            _state["cycle_start"] = t0
             # Save the camera input immediately, before the (possibly slow /
             # hanging) VLM call, so the dashboard always shows what we see.
             cv2.imwrite(str(DEBUG_DIR / "latest_rgb.png"),
@@ -321,6 +322,7 @@ def _perception_worker():
             _dump_debug(frame)
         except Exception as e:      # keep last good barrier on any failure
             print(f"[perception] update failed: {e}")
+        _state["cycle_start"] = None
         _busy.clear()
 
 
@@ -398,10 +400,13 @@ try:
 
     world.step(render=True)
     if step % 60 == 0:
+        import time as _time
         d_goal = float(np.linalg.norm(base.state[:2] - np.asarray(args.goal)))
+        cs = _state.get("cycle_start")
+        wait = f" perceiving={_time.time()-cs:4.0f}s" if cs else ""
         print(f"t={step*PHYSICS_DT:5.1f}s pos=({base.state[0]:+.2f},"
               f"{base.state[1]:+.2f}) h={pipeline.debug.h:6.2f} "
-              f"filtered={pipeline.debug.filtered} d_goal={d_goal:.2f}")
+              f"filtered={pipeline.debug.filtered} d_goal={d_goal:.2f}{wait}")
         # Dashboard hook (optional viewer; harmless if nothing reads it).
         telemetry.write_status(
             t=step * PHYSICS_DT, x=float(base.state[0]), y=float(base.state[1]),
