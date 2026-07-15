@@ -238,29 +238,57 @@ _busy = threading.Event()
 _state = {"last_perception": None}   # wall time of last completed cycle
 
 
-DEBUG_DIR = Path("results/isaac_debug")
+DEBUG_DIR = Path("results/isaac_debug").resolve()
 DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+print(f"[debug] artifacts will be written to: {DEBUG_DIR}")
 
 
 def _dump_debug(frame):
-    """Save RGB, VLM output, and mask overlay for offline inspection."""
+    """Save RGB, VLM output, mask overlay, and costmap for inspection.
+    Each artifact is saved independently so one failure cannot hide the rest."""
     import time as _time
     import cv2
     ts = _time.strftime("%H%M%S")
-    cv2.imwrite(str(DEBUG_DIR / f"{ts}_rgb.png"), frame["rgb"][:, :, ::-1])
-    c = pipeline.debug.constraints
-    txt = "no constraints" if c is None else (
-        f"logic: {c.safety_logic}\nclasses: {c.classes}\n"
-        f"safe: {[str(p) for p in c.safe]}\nunsafe: {[str(p) for p in c.unsafe]}\n"
-        f"raw:\n{getattr(vlm, 'last_raw', '')}")
-    (DEBUG_DIR / f"{ts}_vlm.txt").write_text(txt)
-    if pipeline.debug.unsafe_mask is not None:
-        ov = frame["rgb"].copy()
-        ov[pipeline.debug.safe_mask] = (0.5 * ov[pipeline.debug.safe_mask]
-                                        + [0, 120, 0]).astype("uint8")
-        ov[pipeline.debug.unsafe_mask] = (0.5 * ov[pipeline.debug.unsafe_mask]
-                                          + [120, 0, 0]).astype("uint8")
-        cv2.imwrite(str(DEBUG_DIR / f"{ts}_masks.png"), ov[:, :, ::-1])
+    try:
+        rgb = np.ascontiguousarray(frame["rgb"][:, :, ::-1])
+        cv2.imwrite(str(DEBUG_DIR / f"{ts}_rgb.png"), rgb)
+    except Exception as e:
+        print(f"[debug] rgb save failed: {e}")
+    try:
+        c = pipeline.debug.constraints
+        txt = "no constraints" if c is None else (
+            f"logic: {c.safety_logic}\nclasses: {c.classes}\n"
+            f"safe: {[str(p) for p in c.safe]}\n"
+            f"unsafe: {[str(p) for p in c.unsafe]}\n"
+            f"raw:\n{getattr(vlm, 'last_raw', '')}")
+        (DEBUG_DIR / f"{ts}_vlm.txt").write_text(txt, encoding="utf-8")
+    except Exception as e:
+        print(f"[debug] vlm save failed: {e}")
+    try:
+        if pipeline.debug.unsafe_mask is not None:
+            ov = frame["rgb"].astype(np.float32)
+            ov[pipeline.debug.safe_mask, 1] += 120     # green = safe
+            ov[pipeline.debug.unsafe_mask, 0] += 120   # red   = unsafe
+            ov = np.ascontiguousarray(np.clip(ov, 0, 255).astype(np.uint8)[:, :, ::-1])
+            cv2.imwrite(str(DEBUG_DIR / f"{ts}_masks.png"), ov)
+    except Exception as e:
+        print(f"[debug] mask save failed: {e}")
+    try:
+        # Top-down costmap: what the barrier actually enforces right now.
+        cm = pipeline.costmap
+        img = np.full((cm.ny, cm.nx, 3), 128, dtype=np.uint8)   # gray unknown
+        observed = (cm.n_safe + cm.n_unsafe).T > 0
+        safe = cm.safe_grid().T
+        img[observed & safe] = (0, 160, 0)
+        img[observed & ~safe] = (0, 0, 200)                     # BGR red
+        ix, iy = cm.state_to_cell(base.state[0], base.state[1])
+        cv2.circle(img, (ix, iy), 2, (255, 200, 0), -1)          # robot
+        img = cv2.resize(img[::-1], (cm.nx * 6, cm.ny * 6),
+                         interpolation=cv2.INTER_NEAREST)
+        cv2.imwrite(str(DEBUG_DIR / f"{ts}_costmap.png"), img)
+    except Exception as e:
+        print(f"[debug] costmap save failed: {e}")
+    print(f"[debug] saved {ts}_* to {DEBUG_DIR}")
 
 
 def _perception_worker():
