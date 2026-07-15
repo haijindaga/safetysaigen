@@ -37,17 +37,24 @@ PARAM_SPECS = [
     ("max_barrier_age", 0.0, 120.0, 1.0),
     ("perception_every", 5, 300, 5),
     ("tau", 0.1, 0.9, 0.05),
+    ("costmap_decay", 0.8, 1.0, 0.01),
 ]
 
 
+def _active_dir() -> Path:
+    """Newest run subfolder, or DIR itself for flat (legacy) layouts."""
+    subs = [d for d in DIR.iterdir() if d.is_dir()] if DIR.exists() else []
+    return max(subs, key=lambda d: d.stat().st_mtime) if subs else DIR
+
+
 def _latest(kind: str) -> Path | None:
-    files = sorted(DIR.glob(f"*_{kind}.png"))
+    files = sorted(_active_dir().glob(f"*_{kind}.png"))
     return files[-1] if files else None
 
 
 def _kinds() -> list[str]:
     seen = {}
-    for f in DIR.glob("*_*.png"):
+    for f in _active_dir().glob("*_*.png"):
         seen.setdefault(f.stem.split("_", 1)[1], None)
     order = ["rgb", "masks", "costmap"]
     return sorted(seen, key=lambda k: (order.index(k) if k in order else 99, k))
@@ -69,14 +76,14 @@ def _gpu() -> str:
 def api_status():
     status = {}
     try:
-        status = json.loads((DIR / "status.json").read_text(encoding="utf-8"))
+        status = json.loads((_active_dir() / "status.json").read_text(encoding="utf-8"))
     except Exception:
         pass
-    vlm_files = sorted(DIR.glob("*_vlm.txt"))
+    vlm_files = sorted(_active_dir().glob("*_vlm.txt"))
     vlm = vlm_files[-1].read_text(encoding="utf-8", errors="replace") if vlm_files else ""
     params = {}
     try:
-        params = json.loads((DIR / "params.json").read_text(encoding="utf-8"))
+        params = json.loads((_active_dir() / "params.json").read_text(encoding="utf-8"))
     except Exception:
         pass
     return jsonify({"status": status, "kinds": _kinds(), "gpu": _gpu(),
@@ -94,11 +101,11 @@ def img(kind):
 @app.post("/api/params")
 def set_params():
     try:
-        current = json.loads((DIR / "params.json").read_text(encoding="utf-8"))
+        current = json.loads((_active_dir() / "params.json").read_text(encoding="utf-8"))
     except Exception:
         current = {}
     current.update(request.get_json(force=True))
-    (DIR / "params.json").write_text(json.dumps(current), encoding="utf-8")
+    (_active_dir() / "params.json").write_text(json.dumps(current), encoding="utf-8")
     return jsonify(current)
 
 

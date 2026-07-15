@@ -34,6 +34,8 @@ class CoreConfig:
     max_range: float = 7.0
     max_height: float | None = None  # drop projected points above this [m]
                                      # (kills wall-ghost obstacles)
+    costmap_decay: float = 1.0       # <1 forgets old votes each update
+                                     # (stale ghosts fade as views change)
     v_max: float = 0.35
     omega_max: float = 1.0
     perception_period: int = 10     # control steps between perception updates
@@ -95,6 +97,9 @@ class CorePipeline:
             constraints, seg, self.cfg.around_kernel_px)
         self.debug.safe_mask, self.debug.unsafe_mask = safe_mask, unsafe_mask
 
+        if self.cfg.costmap_decay < 1.0:
+            self.costmap.n_safe *= self.cfg.costmap_decay
+            self.costmap.n_unsafe *= self.cfg.costmap_decay
         safe_pts, unsafe_pts = project_masks_to_world(
             self.camera, depth, safe_mask, unsafe_mask, robot_pose,
             self.cfg.min_range, self.cfg.max_range, self.cfg.pixel_stride,

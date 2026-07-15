@@ -240,10 +240,15 @@ _busy = threading.Event()
 _state = {"last_perception": None}   # wall time of last completed cycle
 
 
-DEBUG_DIR = Path("results/isaac_debug").resolve()
+import time as _boot_time
+# One folder per run: results/isaac_debug/<timestamp>_<config>/
+_run_name = (_boot_time.strftime("%Y%m%d-%H%M%S")
+             + f"_{args.scene}_{args.vlm}_{args.segmenter}")
+DEBUG_DIR = (Path("results/isaac_debug") / _run_name).resolve()
 DEBUG_DIR.mkdir(parents=True, exist_ok=True)
 print(f"[debug] artifacts will be written to: {DEBUG_DIR}")
 telemetry = TelemetryWriter(DEBUG_DIR)
+(DEBUG_DIR / "run_config.txt").write_text(str(vars(args)), encoding="utf-8")
 
 
 def _dump_debug(frame):
@@ -427,6 +432,8 @@ try:
             args.perception_every = max(1, int(p["perception_every"]))
         if "tau" in p:
             pipeline.costmap.tau = float(p["tau"])
+        if "costmap_decay" in p:
+            pipeline.cfg.costmap_decay = float(p["costmap_decay"])
         if d_goal < 0.25:
             print("reached goal")
             break
