@@ -74,6 +74,8 @@ robot's next behavior:
 - "PROCEED": the scene is understood; continuing toward the goal is safe.
 - "SLOW": somewhat uncertain; continue but at reduced speed.
 - "STOP_AND_SCAN": stop and rotate in place to look around before moving.
+  Prefer this whenever objects central to your plan are no longer
+  visible, or you are unsure of your surroundings or position.
 - "INVESTIGATE": there is an unobserved/occluded area that matters (e.g.
   space hidden behind objects, beyond a doorway). Move to observe it FROM
   A SAFE DISTANCE before committing to a path.

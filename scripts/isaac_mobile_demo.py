@@ -233,6 +233,11 @@ else:
 
 world.reset()
 camera.initialize()
+try:
+    camera.set_clipping_range(0.05, 100.0)
+    print("[camera] clipping range set to 0.05-100 m")
+except Exception as e:
+    print(f"[camera] clipping range not set: {e}")
 if args.cam_fov > 0 and args.camera == "own":
     try:      # widen the FOV: focal = aperture / (2 tan(fov/2))
         ap = float(camera.get_horizontal_aperture())
@@ -360,7 +365,8 @@ def _dump_debug(frame):
         img[floor] = (0, 160, 0)
         img[cm.zone_active().T] = (0, 140, 255)                 # BGR orange
         img[cm.occupied().T] = (0, 0, 190)                      # BGR red
-        ix, iy = cm.state_to_cell(base.state[0], base.state[1])
+        _p = frame.get("pose", base.state)
+        ix, iy = cm.state_to_cell(_p[0], _p[1])
         cv2.circle(img, (ix, iy), 2, (255, 200, 0), -1)          # robot
         img = cv2.resize(img[::-1], (cm.nx * 6, cm.ny * 6),
                          interpolation=cv2.INTER_NEAREST)
@@ -426,6 +432,9 @@ try:
     pos, quat = robot.get_world_pose()
     base.update_pose(pos, quat)
 
+    if (args.frame == "ego" and step % 60 == 0
+            and not _busy.is_set()):
+        pipeline.costmap.recenter(base.state[0], base.state[1])
     if step % args.perception_every == 0 and not _busy.is_set():
         frame = camera.get_current_frame()
         rgba = frame.get("rgba")
@@ -490,11 +499,15 @@ try:
             job, context = "vlm", None
             if args.reasoning == "extended":
                 have_c = pipeline.debug.constraints is not None
+                vanished = ((_state.get("prev_present", set())
+                             & pipeline.known_classes)
+                            - set(present))
+                _state["prev_present"] = set(present)
                 since_vlm = (_now - _state["last_vlm"]
                              if _state["last_vlm"] else 1e9)
                 stuck = (_state["stuck_since"] is not None
                          and _now - _state["stuck_since"] > 8.0)
-                trigger = (not have_c
+                trigger = (bool(vanished) or not have_c
                            or pipeline.debug.novelty > args.novelty_threshold
                            or since_vlm > args.vlm_max_interval
                            or stuck)
@@ -525,7 +538,10 @@ try:
                                f"{pipeline.debug.novelty:.0%}; "
                                f"robot currently blocked by safety filter: "
                                f"{stuck}; nearest boundary of unobserved "
-                               f"space: {fr_txt}.")
+                               f"space: {fr_txt}."
+                               + (f" NOTE: previously visible "
+                                  f"{sorted(vanished)} no longer"
+                                  f" in view." if vanished else ""))
             with _lock:
                 _latest.update(
                     rgb=np.asarray(rgba)[:, :, :3].copy(),
