@@ -84,6 +84,10 @@ parser.add_argument("--frame", choices=["ego", "world"], default="ego",
 parser.add_argument("--cam-fov", type=float, default=90.0,
                     help="own camera: horizontal field of view in degrees "
                          "(0 = leave the asset default ~50 deg)")
+parser.add_argument("--no-goal", action="store_true",
+                    help="no fixed goal: the nominal command is zero and "
+                         "motion comes only from VLM behaviors "
+                         "(INVESTIGATE/STOP_AND_SCAN) per the mission")
 parser.add_argument("--estop-dist", type=float, default=0.35,
                     help="depth reflex layer: cut forward motion when any "
                          "central depth pixel is closer than this [m]; 0=off")
@@ -517,6 +521,10 @@ try:
                         base.state[:2] - np.asarray(args.goal)))
                     mission = (f"MISSION: {args.mission}. "
                                if args.mission else "")
+                    if args.no_goal:
+                        mission += ("There is NO fixed goal; "
+                                    "decide motion via behaviors "
+                                    "to fulfil the mission. ")
                     if _state["progress"] or _state["plan"]:
                         mission += (f"YOUR PREVIOUS NOTES -> progress: "
                                     f"{_state['progress']} | plan: "
@@ -556,7 +564,8 @@ try:
     import time as _time
     _now = _time.time()
     # ---- nominal planner: A* replanning on the costmap -------------------
-    if (args.nominal == "astar" and step % 120 == 0
+    if (args.nominal == "astar" and not args.no_goal
+            and step % 120 == 0
             and pipeline.barrier is not None):
         path = plan_path(pipeline.costmap,
                          (base.state[0], base.state[1]), tuple(args.goal))
@@ -644,6 +653,39 @@ try:
         print(f"t={step*PHYSICS_DT:5.1f}s pos=({base.state[0]:+.2f},"
               f"{base.state[1]:+.2f}) h={pipeline.debug.h:6.2f} "
               f"filtered={pipeline.debug.filtered} d_goal={d_goal:.2f}{wait}")
+        try:                       # live camera view (not cycle-bound)
+            import cv2
+            _fr = camera.get_current_frame()
+            _rgba = _fr.get('rgba')
+            if _rgba is None or np.asarray(_rgba).size <= 1:
+                _rgba = _fr.get('rgb')
+            if _rgba is not None and np.asarray(_rgba).size > 1:
+                cv2.imwrite(str(DEBUG_DIR / 'latest_rgb.png'),
+                            np.ascontiguousarray(
+                                np.asarray(_rgba)[:, :, 2::-1]))
+            _d = _fr.get('distance_to_image_plane')
+            if _d is not None and np.asarray(_d).size > 1:
+                dv = np.clip(np.nan_to_num(np.asarray(_d), nan=6.0,
+                             posinf=6.0) / 6.0 * 255.0, 0, 255)
+                cv2.imwrite(str(DEBUG_DIR / 'latest_depth.png'),
+                            cv2.applyColorMap(dv.astype(np.uint8),
+                                              cv2.COLORMAP_TURBO))
+        except Exception:
+            pass
+        try:                       # live costmap panel (worker-independent)
+            import cv2
+            cm = pipeline.costmap
+            img = np.full((cm.ny, cm.nx, 3), 128, dtype=np.uint8)
+            img[(cm.n_safe.T > 0)] = (0, 160, 0)
+            img[cm.zone_active().T] = (0, 140, 255)
+            img[cm.occupied().T] = (0, 0, 190)
+            ix, iy = cm.state_to_cell(base.state[0], base.state[1])
+            cv2.circle(img, (ix, iy), 2, (255, 200, 0), -1)
+            img = cv2.resize(img[::-1], (cm.nx * 6, cm.ny * 6),
+                             interpolation=cv2.INTER_NEAREST)
+            cv2.imwrite(str(DEBUG_DIR / 'latest_costmap.png'), img)
+        except Exception:
+            pass
         # Dashboard hook (optional viewer; harmless if nothing reads it).
         telemetry.write_status(
             t=step * PHYSICS_DT, x=float(base.state[0]), y=float(base.state[1]),
