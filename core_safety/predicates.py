@@ -43,6 +43,8 @@ class SafetyConstraints:
     behavior: str | None = None          # one of BEHAVIORS
     behavior_reason: str = ""
     message: str = ""                    # question/report for the human
+    progress: str = ""                   # mission log the VLM keeps for itself
+    plan: str = ""                       # its intended next steps
 
     def all_classes(self) -> list[str]:
         """Classes referenced anywhere (for the segmentation front-end)."""
@@ -94,4 +96,6 @@ def parse_vlm_output(text: str) -> SafetyConstraints:
         behavior=behavior,
         behavior_reason=str(obj.get("behavior_reason", "")),
         message=str(obj.get("message", "")),
+        progress=str(obj.get("progress", "")),
+        plan=str(obj.get("plan", "")),
     )

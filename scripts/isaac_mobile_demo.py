@@ -292,7 +292,8 @@ _latest = {}          # frame handed to the worker
 _busy = threading.Event()
 _state = {"last_perception": None,   # wall time of last completed cycle
           "last_vlm": None, "new_vlm": False, "stuck_since": None,
-          "behavior": "-", "vlm_message": ""}
+          "behavior": "-", "vlm_message": "",
+          "progress": "", "plan": "", "decisions": []}
 # Behavior-executor modifiers (extended reasoning mode).
 _mode = {"scan_until": 0.0, "slow_until": 0.0, "ask_until": 0.0,
          "invest": None, "invest_until": 0.0}
@@ -350,13 +351,15 @@ def _dump_debug(frame):
     except Exception as e:
         print(f"[debug] depth save failed: {e}")
     try:
-        # Top-down costmap: what the barrier actually enforces right now.
+        # Top-down costmap, three kinds of unsafe kept apart:
+        #   dark red = depth-confirmed occupancy, orange = VLM-declared
+        #   zone, green = confirmed floor, gray = never observed.
         cm = pipeline.costmap
-        img = np.full((cm.ny, cm.nx, 3), 128, dtype=np.uint8)   # gray unknown
-        observed = (cm.n_safe + cm.n_unsafe).T > 0
-        safe = cm.safe_grid().T
-        img[observed & safe] = (0, 160, 0)
-        img[observed & ~safe] = (0, 0, 200)                     # BGR red
+        img = np.full((cm.ny, cm.nx, 3), 128, dtype=np.uint8)
+        floor = (cm.n_safe.T > 0)
+        img[floor] = (0, 160, 0)
+        img[cm.zone_active().T] = (0, 140, 255)                 # BGR orange
+        img[cm.occupied().T] = (0, 0, 190)                      # BGR red
         ix, iy = cm.state_to_cell(base.state[0], base.state[1])
         cv2.circle(img, (ix, iy), 2, (255, 200, 0), -1)          # robot
         img = cv2.resize(img[::-1], (cm.nx * 6, cm.ny * 6),
@@ -501,6 +504,14 @@ try:
                         base.state[:2] - np.asarray(args.goal)))
                     mission = (f"MISSION: {args.mission}. "
                                if args.mission else "")
+                    if _state["progress"] or _state["plan"]:
+                        mission += (f"YOUR PREVIOUS NOTES -> progress: "
+                                    f"{_state['progress']} | plan: "
+                                    f"{_state['plan']}. ")
+                    if _state["decisions"]:
+                        mission += ("YOUR RECENT DECISIONS: "
+                                    + "; ".join(_state["decisions"][-3:])
+                                    + ". ")
                     brg = np.degrees(
                         np.arctan2(args.goal[1] - base.state[1],
                                    args.goal[0] - base.state[0])
@@ -555,8 +566,19 @@ try:
             _mode["ask_until"] = _now + 30.0
         _state["behavior"] = b
         _state["vlm_message"] = getattr(c, "message", "") or ""
+        if c is not None:
+            if c.progress:
+                _state["progress"] = c.progress
+            if c.plan:
+                _state["plan"] = c.plan
+            _state["decisions"].append(
+                f"{b} ({getattr(c, 'behavior_reason', '')[:80]})")
+            _state["decisions"] = _state["decisions"][-5:]
         print(f"[behavior] {b} — {getattr(c, 'behavior_reason', '')} "
               f"{('MSG: ' + _state['vlm_message']) if _state['vlm_message'] else ''}")
+        if _state["plan"]:
+            print(f"[mission] progress: {_state['progress']} | "
+                  f"plan: {_state['plan']}")
     inv = _mode.get("invest")
     if inv is not None and (inv.done or _now > _mode["invest_until"]):
         _mode["invest"] = None
@@ -613,6 +635,7 @@ try:
             filtered=bool(pipeline.debug.filtered), d_goal=d_goal,
             cycle_s=_state.get("cycle_s"), vlm=args.vlm,
             reasoning=args.reasoning, behavior=_state["behavior"],
+            progress=_state["progress"], plan=_state["plan"],
             planner=args.nominal,
             front_min=round(_state.get("front_min", 99.0), 2),
             novelty=round(pipeline.debug.novelty, 3),

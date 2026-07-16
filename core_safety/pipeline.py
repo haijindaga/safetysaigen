@@ -40,7 +40,7 @@ class CoreConfig:
     ego_window: bool = False         # rolling robot-centered map window:
                                      # only relative geometry is kept, votes
                                      # leaving the window are forgotten
-    geometric_layer: bool = False    # also mark ANY above-floor depth point
+    geometric_layer: bool = True     # occupancy layer: ANY above-floor depth point
                                      # unsafe (walls/objects the VLM did not
                                      # name still enter the barrier)
     v_max: float = 0.35
@@ -111,7 +111,7 @@ class CorePipeline:
                              0, cm.nx - 1)
                 iy = np.clip(((pts[:, 1] - cm.y_min) / cm.res).astype(int),
                              0, cm.ny - 1)
-                unseen = (cm.n_safe[ix, iy] + cm.n_unsafe[ix, iy]) == 0
+                unseen = ~(cm.observed()[ix, iy])
                 novelty = float(unseen.mean())
         self.debug.novelty = novelty
         self._ground(constraints, seg, depth, robot_pose)
@@ -122,7 +122,7 @@ class CorePipeline:
         """World position of the nearest safe cell that borders unobserved
         space (a candidate vantage point for INVESTIGATE)."""
         cm = self.costmap
-        observed = (cm.n_safe + cm.n_unsafe) > 0
+        observed = cm.observed()
         safe = cm.safe_grid() & observed
         pad = np.pad(observed, 1, constant_values=False)
         near_unobs = ~(pad[:-2, 1:-1] & pad[2:, 1:-1]
@@ -170,6 +170,8 @@ class CorePipeline:
 
     def _ground(self, constraints, seg, depth, robot_pose):
         from .grounding.operators import predicate_to_mask
+        import time as _t
+        now = _t.time()
         if self.cfg.ego_window:
             self.costmap.recenter(robot_pose[0], robot_pose[1])
         shape = depth.shape
@@ -182,13 +184,13 @@ class CorePipeline:
                     return m
             return None
 
-        # Unsafe: project per predicate. For zone operators (AROUND/BETWEEN)
-        # clamp the projection depth to the anchor object's own depth — the
-        # zone lives WHERE THE OBJECTS ARE. Without this, hull/dilation
-        # pixels that see the floor THROUGH the gaps borrow that far floor's
-        # depth and paint everything behind the line red.
+        # ZONE layer: regions the VLM *declared* unsafe (buffers, barriers,
+        # prohibited surfaces). These legitimately sit on visibly empty
+        # floor, so depth never clears them — they expire only when the VLM
+        # stops re-asserting them (TTL). AROUND/BETWEEN pixels that see
+        # PAST the anchor object are clamped to its depth: the declared
+        # zone lives at the objects, never meters behind them.
         unsafe_union = np.zeros(shape, dtype=bool)
-        pts_list = []
         for p in constraints.unsafe:
             m = predicate_to_mask(p, seg, self.cfg.around_kernel_px)
             if m.shape != shape or not m.any():
@@ -202,13 +204,11 @@ class CorePipeline:
                     if ad.size:
                         cap = float(np.percentile(ad, 90)) + 0.75
                         d_use = np.minimum(depth, cap)
-            pts = pixels_to_world(self.camera, d_use, m & stride, robot_pose,
-                                  self.cfg.min_range, self.cfg.max_range,
-                                  self.cfg.max_height)
-            if len(pts):
-                pts_list.append(pts)
-        unsafe_pts = (np.concatenate(pts_list) if pts_list
-                      else np.zeros((0, 2)))
+            zone_pts = pixels_to_world(self.camera, d_use, m & stride,
+                                       robot_pose, self.cfg.min_range,
+                                       self.cfg.max_range,
+                                       self.cfg.max_height)
+            self.costmap.paint_zone(zone_pts, now)
 
         safe_union = np.zeros(shape, dtype=bool)
         for p in constraints.safe:
@@ -221,26 +221,27 @@ class CorePipeline:
 
         if self.cfg.costmap_decay < 1.0:
             self.costmap.n_safe *= self.cfg.costmap_decay
-            self.costmap.n_unsafe *= self.cfg.costmap_decay
+        # OCCUPANCY layer: depth is the authority. Any above-floor return
+        # is a physical-obstacle vote regardless of what the VLM calls it.
+        # Fast decay: once depth stops seeing anything there, the cell
+        # clears within ~2 cycles ("if depth says empty -> not red").
+        occ_pts = np.zeros((0, 2))
         if self.cfg.geometric_layer:
             cam = self.camera
             vv = np.arange(depth.shape[0], dtype=float)[:, None]
-            z_px = cam.mount_height - depth * (vv - cam.cy) / cam.fy
+            with np.errstate(invalid="ignore"):
+                z_px = (cam.mount_height
+                        - np.nan_to_num(depth, posinf=1e6)
+                        * (vv - cam.cy) / cam.fy)
             geom = (np.isfinite(depth) & (depth >= self.cfg.min_range)
                     & (depth <= self.cfg.max_range) & (z_px > 0.10)
                     & (z_px <= (self.cfg.max_height or 1.5)))
-            sub = np.zeros_like(geom)
-            sub[::self.cfg.pixel_stride, ::self.cfg.pixel_stride] = True
-            geom_pts = pixels_to_world(cam, depth, geom & sub, robot_pose,
-                                       self.cfg.min_range, self.cfg.max_range)
-            unsafe_pts = (np.vstack([unsafe_pts, geom_pts])
-                          if len(unsafe_pts) else geom_pts)
-        self.costmap.add_points(safe_pts, unsafe_pts)
-        if len(unsafe_pts):
-            r = np.linalg.norm(unsafe_pts - np.asarray(robot_pose[:2]), axis=1)
-            print(f"[ground] unsafe votes n={len(unsafe_pts)} at "
-                  f"{r.min():.2f}-{r.max():.2f} m (median {np.median(r):.2f})")
-        self.barrier = SDFBarrier(self.costmap.safe_grid(),
+            occ_pts = pixels_to_world(cam, depth, geom & stride, robot_pose,
+                                      self.cfg.min_range, self.cfg.max_range)
+            self.debug.unsafe_mask = unsafe_union | geom
+        self.costmap.n_unsafe *= 0.5
+        self.costmap.add_points(safe_pts, occ_pts)
+        self.barrier = SDFBarrier(self.costmap.safe_grid(now),
                                   self.costmap.x_min, self.costmap.y_min,
                                   self.costmap.res)
 

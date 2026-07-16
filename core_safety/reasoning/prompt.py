@@ -80,8 +80,19 @@ robot's next behavior:
 - "ASK_HUMAN": the situation needs human confirmation; put a short
   question in "message".
 
+### 5. MISSION TRACKING
+The MAP CONTEXT includes your MISSION and YOUR PREVIOUS NOTES — the
+"progress" and "plan" YOU wrote on your last call, plus your recent
+behavior decisions. You are a continuing agent, not a fresh one: read
+your notes, update them, and act consistently with your own plan unless
+the scene has changed. Keep an explicit thread: what the mission is,
+what has been accomplished so far, where you are now, and the ordered
+next steps.
+
 Add these keys to the SAME flat JSON object:
 "behavior": "PROCEED",
 "behavior_reason": "one sentence on why",
+"progress": "what is done so far / where you are in the mission",
+"plan": "ordered next steps toward completing the mission",
 "message": ""
 </instructions>""")

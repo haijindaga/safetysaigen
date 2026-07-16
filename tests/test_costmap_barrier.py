@@ -24,12 +24,23 @@ def test_p_safe_and_threshold():
     assert cm.safe_grid()[ix, iy]
 
 
-def test_mixed_votes_majority():
-    cm = SemanticCostmap(0, 2, 0, 2, resolution=1.0, tau=0.5)
+def test_occupancy_dominates_until_cleared():
+    cm = SemanticCostmap(0, 2, 0, 2, resolution=1.0)
     pt = np.array([[0.5, 0.5]])
     cm.add_points(np.repeat(pt, 3, axis=0), np.repeat(pt, 1, axis=0))
-    assert cm.p_safe()[0, 0] == 0.75
+    # A depth-confirmed occupancy vote blocks the cell even on safe floor.
+    assert not cm.safe_grid()[0, 0]
+    # Depth is the authority: once returns stop, decay clears the cell.
+    cm.n_unsafe *= 0.5
+    cm.n_unsafe *= 0.5
     assert cm.safe_grid()[0, 0]
+
+
+def test_zone_layer_persists_and_expires():
+    cm = SemanticCostmap(0, 2, 0, 2, resolution=1.0, zone_ttl=10.0)
+    cm.paint_zone(np.array([[0.5, 0.5]]), now=100.0)
+    assert not cm.safe_grid(now=105.0)[0, 0]   # active zone blocks
+    assert cm.safe_grid(now=111.0)[0, 0]       # expired without re-assertion
 
 
 def test_sdf_sign_and_gradient():
