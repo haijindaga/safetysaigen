@@ -37,6 +37,9 @@ class CoreConfig:
                                      # (kills wall-ghost obstacles)
     costmap_decay: float = 1.0       # <1 forgets old votes each update
                                      # (stale ghosts fade as views change)
+    ego_window: bool = False         # rolling robot-centered map window:
+                                     # only relative geometry is kept, votes
+                                     # leaving the window are forgotten
     geometric_layer: bool = False    # also mark ANY above-floor depth point
                                      # unsafe (walls/objects the VLM did not
                                      # name still enter the barrier)
@@ -166,17 +169,59 @@ class CorePipeline:
         self._ground(constraints, seg, depth, robot_pose)
 
     def _ground(self, constraints, seg, depth, robot_pose):
-        safe_mask, unsafe_mask = build_image_safe_set(
-            constraints, seg, self.cfg.around_kernel_px)
-        self.debug.safe_mask, self.debug.unsafe_mask = safe_mask, unsafe_mask
+        from .grounding.operators import predicate_to_mask
+        if self.cfg.ego_window:
+            self.costmap.recenter(robot_pose[0], robot_pose[1])
+        shape = depth.shape
+        stride = np.zeros(shape, dtype=bool)
+        stride[::self.cfg.pixel_stride, ::self.cfg.pixel_stride] = True
+
+        def _cls_mask(cls):
+            for name, m in seg.items():
+                if name.lower() == cls:
+                    return m
+            return None
+
+        # Unsafe: project per predicate. For zone operators (AROUND/BETWEEN)
+        # clamp the projection depth to the anchor object's own depth — the
+        # zone lives WHERE THE OBJECTS ARE. Without this, hull/dilation
+        # pixels that see the floor THROUGH the gaps borrow that far floor's
+        # depth and paint everything behind the line red.
+        unsafe_union = np.zeros(shape, dtype=bool)
+        pts_list = []
+        for p in constraints.unsafe:
+            m = predicate_to_mask(p, seg, self.cfg.around_kernel_px)
+            if m.shape != shape or not m.any():
+                continue
+            unsafe_union |= m
+            d_use = depth
+            if p.op in ("AROUND", "BETWEEN"):
+                am = _cls_mask(p.cls)
+                if am is not None and am.any():
+                    ad = depth[am & np.isfinite(depth)]
+                    if ad.size:
+                        cap = float(np.percentile(ad, 90)) + 0.75
+                        d_use = np.minimum(depth, cap)
+            pts = pixels_to_world(self.camera, d_use, m & stride, robot_pose,
+                                  self.cfg.min_range, self.cfg.max_range,
+                                  self.cfg.max_height)
+            if len(pts):
+                pts_list.append(pts)
+        unsafe_pts = (np.concatenate(pts_list) if pts_list
+                      else np.zeros((0, 2)))
+
+        safe_union = np.zeros(shape, dtype=bool)
+        for p in constraints.safe:
+            safe_union |= predicate_to_mask(p, seg, self.cfg.around_kernel_px)
+        safe_mask = safe_union & ~unsafe_union
+        self.debug.safe_mask, self.debug.unsafe_mask = safe_mask, unsafe_union
+        safe_pts = pixels_to_world(self.camera, depth, safe_mask & stride,
+                                   robot_pose, self.cfg.min_range,
+                                   self.cfg.max_range, self.cfg.max_height)
 
         if self.cfg.costmap_decay < 1.0:
             self.costmap.n_safe *= self.cfg.costmap_decay
             self.costmap.n_unsafe *= self.cfg.costmap_decay
-        safe_pts, unsafe_pts = project_masks_to_world(
-            self.camera, depth, safe_mask, unsafe_mask, robot_pose,
-            self.cfg.min_range, self.cfg.max_range, self.cfg.pixel_stride,
-            self.cfg.max_height)
         if self.cfg.geometric_layer:
             cam = self.camera
             vv = np.arange(depth.shape[0], dtype=float)[:, None]

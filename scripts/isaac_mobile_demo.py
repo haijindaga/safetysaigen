@@ -77,6 +77,10 @@ parser.add_argument("--nominal", choices=["straight", "astar"],
 parser.add_argument("--mission", default="",
                     help="natural-language task passed to the VLM as context, "
                          "e.g. 'reach the green marker about 5 m ahead'")
+parser.add_argument("--frame", choices=["ego", "world"], default="ego",
+                    help="ego (default) = rolling 8x8 m robot-centered map "
+                         "window (relative geometry only, natural forgetting); "
+                         "world = fixed global map as in the paper")
 parser.add_argument("--cam-fov", type=float, default=90.0,
                     help="own camera: horizontal field of view in degrees "
                          "(0 = leave the asset default ~50 deg)")
@@ -246,6 +250,7 @@ cfg = CoreConfig(min_range=0.15, max_range=6.0,    # near clip lowered: the
                  # floor right in front must keep voting safe so stale red
                  # clears (depth says empty => safe); e-stop guards contact
                  max_height=0.6,                   # drop wall-pixel ghosts
+                 ego_window=(args.frame == "ego"),
                  v_max=V_MAX, omega_max=OMEGA_MAX,
                  perception_period=1)              # we gate perception ourselves
 
@@ -273,7 +278,9 @@ print(f"[camera] optical height above ground: {_cam_h:.3f} m")
 pin_cam = camera_from_intrinsics(camera.get_intrinsics_matrix(),
                                  CAM_RES[0], CAM_RES[1], mount_height=_cam_h)
 pipeline = CorePipeline(vlm, segmenter, pin_cam,
-                        workspace=(-2.0, 8.0, -4.0, 4.0), config=cfg)
+                        workspace=((-4.0, 4.0, -4.0, 4.0)
+                                   if args.frame == "ego"
+                                   else (-2.0, 8.0, -4.0, 4.0)), config=cfg)
 
 base = IsaacPlanarBase(dt=PHYSICS_DT, v_max=V_MAX, omega_max=OMEGA_MAX,
                        holonomic=False)

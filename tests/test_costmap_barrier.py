@@ -49,3 +49,18 @@ def test_all_safe_barrier_inactive():
     grid = np.ones((10, 10), dtype=bool)
     b = SDFBarrier(grid, 0, 0, 0.2)
     assert np.isinf(b.h(1.0, 1.0))
+
+
+def test_ego_recenter_preserves_world_content():
+    cm = SemanticCostmap(-4, 4, -4, 4, resolution=0.2)
+    cm.add_points(safe_pts=np.zeros((0, 2)),
+                  unsafe_pts=np.array([[2.0, 1.0]] * 3))
+    cm.recenter(2.0, 1.0)              # robot moves near the obstacle
+    ix, iy = cm.state_to_cell(2.0, 1.0)
+    # The unsafe vote is still at world (2, 1) after the window scrolled.
+    assert cm.n_unsafe[ix, iy] == 3
+    # Window is now centered on the robot.
+    assert abs((cm.x_min + cm.nx * cm.res / 2) - 2.0) < cm.res
+    # Content scrolled far out of the window is forgotten.
+    cm.recenter(20.0, 1.0)
+    assert cm.n_unsafe.sum() == 0

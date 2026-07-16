@@ -57,3 +57,25 @@ class SemanticCostmap:
         xs = self.x_min + (np.arange(self.nx) + 0.5) * self.res
         ys = self.y_min + (np.arange(self.ny) + 0.5) * self.res
         return xs, ys
+
+    def recenter(self, x: float, y: float):
+        """Ego window: scroll the grid (whole cells) so (x, y) sits at the
+        window center. Cell contents keep their WORLD position — only the
+        window moves; votes scrolled out of the window are forgotten."""
+        cx = self.x_min + self.nx * self.res / 2.0
+        cy = self.y_min + self.ny * self.res / 2.0
+        dx = int(round((x - cx) / self.res))
+        dy = int(round((y - cy) / self.res))
+        if dx == 0 and dy == 0:
+            return
+        src_x = slice(max(dx, 0), self.nx + min(dx, 0))
+        dst_x = slice(max(-dx, 0), self.nx + min(-dx, 0))
+        src_y = slice(max(dy, 0), self.ny + min(dy, 0))
+        dst_y = slice(max(-dy, 0), self.ny + min(-dy, 0))
+        for name in ("n_safe", "n_unsafe"):
+            arr = getattr(self, name)
+            out = np.zeros_like(arr)
+            out[dst_x, dst_y] = arr[src_x, src_y]
+            setattr(self, name, out)
+        self.x_min += dx * self.res
+        self.y_min += dy * self.res
