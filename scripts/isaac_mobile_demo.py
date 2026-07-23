@@ -58,12 +58,16 @@ parser.add_argument("--no-wait-perception", action="store_true",
 parser.add_argument("--max-barrier-age", type=float, default=0.0,
                     help="stop if the barrier is older than this many seconds "
                          "(0 = disabled); stop-start mode for slow perception")
-parser.add_argument("--reasoning", choices=["faithful", "extended"],
+parser.add_argument("--reasoning", choices=["faithful", "extended", "lavira"],
                     default="faithful",
                     help="faithful = paper prompt, VLM every cycle; "
                          "extended = event-driven VLM with behavior decisions "
                          "(PROCEED/SLOW/STOP_AND_SCAN/INVESTIGATE/ASK_HUMAN); "
-                         "SAM3+depth keep grounding between VLM calls")
+                         "SAM3+depth keep grounding between VLM calls; "
+                         "lavira = LA/VA/RA translation loop (4-view panorama "
+                         "-> TODO+direction -> landmark bbox+depth -> subgoal), "
+                         "safety layers unchanged; needs --vlm ollama and "
+                         "--mission (or --target)")
 parser.add_argument("--novelty-threshold", type=float, default=0.35,
                     help="extended mode: fraction of unexplained in-range "
                          "pixels that triggers a VLM call")
@@ -99,6 +103,12 @@ parser.add_argument("--estop-dist", type=float, default=0.35,
                     help="depth reflex layer: cut forward motion when any "
                          "central depth pixel is closer than this [m]; 0=off")
 args = parser.parse_args()
+
+if args.reasoning == "lavira":
+    if args.vlm != "ollama":
+        parser.error("--reasoning lavira requires --vlm ollama")
+    if not (args.mission or args.target):
+        parser.error("--reasoning lavira requires --mission and/or --target")
 
 # ---- Isaac boot (must precede any other isaac import) ----------------------
 try:
@@ -283,7 +293,7 @@ else:
 # grounded from a VA bounding box + depth. The VA proposes, the CBF still
 # arbitrates every command, so a hallucinated box cannot cause a collision.
 va_client = None
-if args.target:
+if args.target or args.reasoning == "lavira":
     if args.vlm == "ollama":
         from core_safety.reasoning.goal_grounding import OllamaVA
         va_client = OllamaVA(model=args.ollama_model,
@@ -291,6 +301,13 @@ if args.target:
     else:
         print("[goal-grounding] --target requires --vlm ollama; "
               "the goal will never be grounded in rulebook mode")
+
+# LaViRA mode: strategic LA layer (panorama -> TODO + direction).
+la_client = None
+if args.reasoning == "lavira":
+    from core_safety.reasoning.lavira import OllamaLA
+    la_client = OllamaLA(model=args.ollama_model,
+                         num_gpu=args.ollama_num_gpu)
 
 gt_segmenter = GroundTruthSegmenter()
 if args.segmenter == "sam3":
@@ -324,8 +341,9 @@ _state = {"last_perception": None,   # wall time of last completed cycle
           "behavior": "-", "vlm_message": "",
           "progress": "", "plan": "", "decisions": [],
           # goal is dynamic: (x, y) tuple, or None while a --target has not
-          # been visually grounded yet
-          "goal": None if args.target else tuple(args.goal),
+          # been visually grounded yet (lavira: None until a subgoal exists)
+          "goal": (None if (args.target or args.reasoning == "lavira")
+                   else tuple(args.goal)),
           "va_reason": ""}
 
 
@@ -340,6 +358,33 @@ def _current_goal():
 # Behavior-executor modifiers (extended reasoning mode).
 _mode = {"scan_until": 0.0, "slow_until": 0.0, "ask_until": 0.0,
          "invest": None, "invest_until": 0.0}
+
+# LaViRA-mode cycle state (LA -> turn -> VA -> drive -> LA ...).
+_lav = {"state": "panorama",   # panorama|la_wait|turn|va_wait|drive
+        "pano": [],            # captured views, VIEW_ORDER order
+        "start_yaw": 0.0, "started": False,
+        "todo": "", "history": [], "turn_to": 0.0,
+        "landmark": "", "va_retry": 0, "drive_since": 0.0}
+
+
+def _wrap_pi(a: float) -> float:
+    return (a + np.pi) % (2 * np.pi) - np.pi
+
+
+def _grab_rgbd():
+    """Latest camera RGB-D (rgb, depth) or None if not ready yet."""
+    fr = camera.get_current_frame()
+    rgba = fr.get("rgba")
+    if rgba is None or np.asarray(rgba).size <= 1:
+        rgba = fr.get("rgb")
+    d = fr.get("distance_to_image_plane")
+    if (rgba is None or np.asarray(rgba).size <= 1
+            or d is None or np.asarray(d).size <= 1):
+        return None
+    rgba = np.asarray(rgba)
+    if rgba.ndim != 3 or rgba.shape[2] < 3:
+        return None
+    return rgba[:, :, :3].copy(), np.asarray(d, dtype=float).copy()
 
 
 import time as _boot_time
@@ -428,10 +473,47 @@ def _perception_worker():
             _state["cycle_start"] = t0
             # Save the camera input immediately, before the (possibly slow /
             # hanging) VLM call, so the dashboard always shows what we see.
-            cv2.imwrite(str(DEBUG_DIR / "latest_rgb.png"),
-                        np.ascontiguousarray(frame["rgb"][:, :, ::-1]))
-            gt_segmenter.update(frame["labels"], frame["id_to_name"])
-            if frame.get("job") == "ground":
+            if "rgb" in frame:
+                cv2.imwrite(str(DEBUG_DIR / "latest_rgb.png"),
+                            np.ascontiguousarray(frame["rgb"][:, :, ::-1]))
+            if "labels" in frame:
+                gt_segmenter.update(frame["labels"], frame["id_to_name"])
+            if frame.get("job") == "la":
+                # LaViRA strategic layer: 4-view panorama -> TODO + direction
+                res = la_client.decide(frame["pano"], frame["la_mission"],
+                                       frame["la_todo"], frame["la_history"])
+                _state["la_result"] = res
+                print(f"[la] {_time.time()-t0:.1f}s action={res.action} "
+                      f"dir={res.direction} landmark='{res.expected_landmark}'"
+                      f" ok={res.ok} — {res.reasoning}")
+                if res.updated_todo:
+                    print(f"[la] TODO:\n{res.updated_todo}")
+                for i, v in enumerate(frame["pano"]):
+                    cv2.imwrite(str(DEBUG_DIR /
+                                    f"{_time.strftime('%H%M%S')}_pano{i}.png"),
+                                np.ascontiguousarray(v[:, :, ::-1]))
+            elif frame.get("job") == "va_sub":
+                # LaViRA tactical layer: box the LA landmark -> subgoal
+                from core_safety.reasoning.goal_grounding import bbox_to_goal
+                res = va_client.locate(frame["rgb"], frame["va_target"])
+                _state["va_reason"] = res.reasoning
+                sub = None
+                if res.bbox_px is not None:
+                    g = bbox_to_goal(res.bbox_px, frame["depth"],
+                                     pipeline.camera, frame["pose"],
+                                     min_range=0.15, max_range=cfg.max_range)
+                    if g is not None:
+                        sub = (float(g[0]), float(g[1]))
+                    x1, y1, x2, y2 = res.bbox_px
+                    ov = np.ascontiguousarray(frame["rgb"][:, :, ::-1]).copy()
+                    cv2.rectangle(ov, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    cv2.imwrite(str(
+                        DEBUG_DIR / f"{_time.strftime('%H%M%S')}_va.png"), ov)
+                _state["va_goal"] = sub if sub is not None else False
+                print(f"[va] {_time.time()-t0:.1f}s "
+                      f"'{frame['va_target']}' bbox={res.bbox_px} "
+                      f"subgoal={sub} — {res.reasoning}")
+            elif frame.get("job") == "ground":
                 pipeline.update_grounding(frame["rgb"], frame["depth"],
                                           frame["pose"])
                 _state["last_perception"] = _time.time()
@@ -452,7 +534,8 @@ def _perception_worker():
                 # Piggyback the VA goal-grounding query on the thinking
                 # cycle: one extra VLM call, same frame. Re-grounds on
                 # every cycle so a mislocalized goal self-corrects.
-                if va_client is not None:
+                # (lavira mode grounds goals via its own LA/VA loop instead.)
+                if va_client is not None and args.reasoning != "lavira":
                   try:
                     from core_safety.reasoning.goal_grounding import \
                         bbox_to_goal
@@ -493,6 +576,124 @@ def _perception_worker():
 
 
 threading.Thread(target=_perception_worker, daemon=True).start()
+
+
+def _lavira_tick(u_nom, now):
+    """One 60 Hz tick of the LaViRA cycle; returns the nominal command.
+
+    panorama: rotate in place, capturing 4 views at 90-deg increments
+    la_wait / va_wait: hold still while the worker runs the LA / VA query
+    turn: face the LA-chosen direction, then submit the VA query
+    drive: pass through the caller's A*/waypoint command to the subgoal
+
+    Rotation is translation-free (safe even before the first barrier);
+    every returned command still goes through the CBF filter downstream.
+    """
+    from core_safety.reasoning.lavira import DIRECTIONS, VIEW_ORDER
+    st = _lav["state"]
+    yaw = base.state[2]
+
+    if st == "panorama":
+        if not _lav["started"]:
+            _lav.update(started=True, start_yaw=yaw, pano=[])
+            print("[lavira] panorama scan...")
+        k = len(_lav["pano"])
+        if k >= len(VIEW_ORDER):          # all views captured -> submit LA
+            if not _busy.is_set():
+                mission = args.mission or f"find and reach: {args.target}"
+                with _lock:
+                    _latest.clear()
+                    _latest.update(job="la", pano=list(_lav["pano"]),
+                                   la_mission=mission,
+                                   la_todo=_lav["todo"],
+                                   la_history=list(_lav["history"]))
+                _busy.set()
+                _lav["state"] = "la_wait"
+            return np.zeros(3)
+        want = _lav["start_yaw"] + k * (np.pi / 2)   # CCW capture order
+        if abs(_wrap_pi(yaw - want)) < 0.06:
+            g = _grab_rgbd()
+            if g is not None:
+                _lav["pano"].append(g[0])
+            return np.zeros(3)            # hold still until this view grabbed
+        return np.array([0.0, 0.0, 0.5])
+
+    if st == "la_wait":
+        if "la_result" not in _state:
+            if not _busy.is_set():        # worker errored: LA never answered
+                _lav.update(state="panorama", started=False)
+            return np.zeros(3)
+        res = _state.pop("la_result")
+        _lav["todo"] = res.updated_todo or _lav["todo"]
+        if res.action == "STOP":
+            _state["mission_done"] = True
+            return np.zeros(3)
+        _lav["landmark"] = (res.expected_landmark or args.target
+                           or args.mission)
+        _lav["history"].append(
+            f"went {res.direction} toward '{_lav['landmark']}'")
+        _lav["history"] = _lav["history"][-8:]
+        _lav["turn_to"] = _wrap_pi(_lav["start_yaw"]
+                                   + DIRECTIONS[res.direction])
+        _lav["state"] = "turn"
+        return np.zeros(3)
+
+    if st == "turn":
+        err = _wrap_pi(_lav["turn_to"] - yaw)
+        if abs(err) > 0.09:
+            return np.array([0.0, 0.0,
+                             float(np.clip(2.0 * err, -1.0, 1.0))])
+        if not _busy.is_set():
+            g = _grab_rgbd()
+            if g is not None:
+                with _lock:
+                    _latest.clear()
+                    _latest.update(job="va_sub", rgb=g[0], depth=g[1],
+                                   pose=base.state.copy(),
+                                   va_target=_lav["landmark"])
+                _busy.set()
+                _lav["state"] = "va_wait"
+        return np.zeros(3)
+
+    if st == "va_wait":
+        if "va_goal" not in _state:
+            if not _busy.is_set():        # worker errored: count as a miss
+                _state["va_goal"] = False
+            return np.zeros(3)
+        sub = _state.pop("va_goal")
+        if sub is False:                  # landmark not visible/groundable
+            _lav["va_retry"] += 1
+            _lav["history"].append(
+                f"could not ground '{_lav['landmark']}'")
+            if _lav["va_retry"] >= 3:     # stuck: go look at new space
+                fr = pipeline.nearest_frontier(base.state[0], base.state[1])
+                if fr is not None:
+                    print("[lavira] 3 VA misses -> frontier fallback")
+                    _state["goal"] = (float(fr[0]), float(fr[1]))
+                    _lav.update(state="drive", drive_since=now, va_retry=0)
+                    return u_nom
+            _lav.update(state="panorama", started=False)
+            return np.zeros(3)
+        _lav["va_retry"] = 0
+        _state["goal"] = sub
+        _lav.update(state="drive", drive_since=now)
+        print(f"[lavira] driving to subgoal ({sub[0]:+.2f},{sub[1]:+.2f})")
+        return u_nom
+
+    # drive: the caller already computed u_nom toward _state["goal"]
+    g = _current_goal()
+    reached = (g is not None
+               and float(np.linalg.norm(base.state[:2] - g)) < 0.3)
+    if reached or now - _lav["drive_since"] > 45.0:
+        _lav["history"].append("reached subgoal" if reached
+                               else "subgoal timed out")
+        print(f"[lavira] {'subgoal reached' if reached else 'subgoal timeout'}"
+              " -> next cycle")
+        _state["goal"] = None
+        _lav.update(state="panorama", started=False)
+        return np.zeros(3)
+    return u_nom
+
 
 # ---------------------------------------------------------------------------
 # Main loop
@@ -571,7 +772,10 @@ try:
             import time as _t
             _now = _t.time()
             job, context = "vlm", None
-            if args.reasoning == "extended":
+            if args.reasoning in ("extended", "lavira"):
+                # Event-driven safety thinking layer (both modes). In lavira
+                # the VLM call only refreshes the safety constraints (faithful
+                # prompt); navigation context/decisions live in the LA loop.
                 have_c = pipeline.debug.constraints is not None
                 vanished = ((_state.get("prev_present", set())
                              & pipeline.known_classes)
@@ -586,7 +790,7 @@ try:
                            or since_vlm > args.vlm_max_interval
                            or stuck)
                 job = "vlm" if trigger else "ground"
-                if job == "vlm":
+                if job == "vlm" and args.reasoning == "extended":
                     _g = _current_goal()
                     mission = (f"MISSION: {args.mission}. "
                                if args.mission else "")
@@ -721,6 +925,11 @@ try:
             u_nom = np.zeros(3)
         elif _now < _mode["slow_until"]:
             u_nom = u_nom * 0.5
+    elif args.reasoning == "lavira":
+        u_nom = _lavira_tick(u_nom, _now)
+        if _state.get("mission_done"):
+            print("mission complete (LA STOP)")
+            break
     u_safe = pipeline.safe_control(u_nom, base)
     u_safe = base.clip_input(u_safe)
     # Reflex layer: something inside the projection dead zone -> no forward.
@@ -800,7 +1009,10 @@ try:
             target=args.target or None,
             goal=(None if _state.get("goal") is None
                   else [round(v, 2) for v in _state["goal"]]),
-            va_reason=_state.get("va_reason", ""))
+            va_reason=_state.get("va_reason", ""),
+            la_state=(_lav["state"] if args.reasoning == "lavira" else None),
+            la_todo=(_lav["todo"][:500] if args.reasoning == "lavira"
+                     else None))
         p = telemetry.read_params()
         if "v_max" in p:
             base.v_max = nominal.v_max = float(p["v_max"])
@@ -812,7 +1024,10 @@ try:
             pipeline.costmap.tau = float(p["tau"])
         if "costmap_decay" in p:
             pipeline.cfg.costmap_decay = float(p["costmap_decay"])
-        if d_goal is not None and d_goal < 0.25:
+        # In lavira mode _state["goal"] is a transient subgoal, not the
+        # mission goal; termination there is the LA STOP decision instead.
+        if (args.reasoning != "lavira"
+                and d_goal is not None and d_goal < 0.25):
             print("reached goal")
             break
     step += 1

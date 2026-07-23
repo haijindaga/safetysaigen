@@ -30,6 +30,19 @@ behavior実行器: PROCEED / SLOW(v半減) / STOP_AND_SCAN(その場360°回転)
 INVESTIGATE(最寄りフロンティア=安全セルと未知の境界へ移動) / ASK_HUMAN(30秒停止+
 ダッシュボードに質問表示)。**どのbehaviorでも最終速度指令は必ずCBFを通る。**
 
+**第3モード `--reasoning lavira`(2026-07-23, LaViRA/Uni-LaViRAのアイデアを自前実装)**:
+LA/VA/RAの3段翻訳ループ。①パノラマ(その場回転、90°ごと4枚=FOV90°で360°タイル)
+②LA(4枚+MISSION+markdown TODOリスト+履歴→TODO更新+NAVIGATE/STOPと方向1つ+
+「その視界に実際に見えるランドマーク」1つ)③選択方向へ回頭④VA(1枚でランドマークに
+bbox→bbox下端+深度でサブゴール接地)⑤A*でサブゴール走行(到達0.3m/45sタイムアウトで
+①へ)。終了はLAのSTOP判断。VA接地3連敗でフロンティアへのフォールバック。
+狙い: 「見えないゴール」を「見える中間ランドマークの連鎖」に変換する
+(extendedのSTOP_AND_SCAN/INVESTIGATEは無方向でコーン裏のゴール等に構造的に弱い)。
+安全層(SAM3監視+占有/ゾーン地図+CBF+e-stop)は完全共有・不変で、安全用VLM呼び出しは
+faithfulプロンプトでextended同様のイベント駆動。**LaViRA単体(安全なし思想)を
+我々のCBF層が包む構成のablationが `--reasoning lavira` vs `extended` の1フラグで可能。**
+状態機械はisaac_mobile_demoの_lavira_tick(panorama/la_wait/turn/va_wait/drive)。
+
 ## 3. 数理(勉強用)
 
 **接地(論文Eq.2,3,16)**: セグメントマスク画素(u,v)+深度dをピンホール逆投影
@@ -130,6 +143,10 @@ python scripts/isaac_mobile_demo.py --scene warehouse --vlm ollama --segmenter s
   --ollama-model gemma3:4b --ollama-num-gpu 16 --max-barrier-age 99
 # 言語ゴール接地(ゴール座標を教えない): 上記に --target "green goal marker" を追加
 # (--goalは無視される。[goal-grounding]行とtelemetryのgoal/va_reasonで接地を確認)
+# LaViRAモード(LA/VA/RAループ、ゴールがコーン裏など不可視でも中間ランドマークで前進):
+#   --reasoning lavira --mission "reach the green goal marker" [--target "..."]
+#   ログは [lavira](状態遷移) / [la](TODO+方向) / [va](bbox+サブゴール)。
+#   保存物: <ts>_pano0-3.png(パノラマ4枚) / <ts>_va.png(bbox枠)
 ```
 ログの読み方: `[ground] cycle`=監視層 / `[perception] VLM cycle`=思考層 /
 `[behavior]`,`[mission]`=判断と計画 / `perceiving=Ns`=実行中サイクル経過。
@@ -173,7 +190,7 @@ v_max/max_barrier_age/perception_every/tau/costmap_decayをライブ変更可。
 
 core_safety/: predicates(述語+JSONパース+behavior/plan) / pipeline(統合+3層接地+novelty+
 frontier) / reasoning/(prompt=faithful+extended, vlm_client=Ollama/RuleBased,
-goal_grounding=LaViRA流VA bbox→世界座標ゴール) /
+goal_grounding=LaViRA流VA bbox→世界座標ゴール, lavira=LA層プロンプト+パーサ) /
 grounding/(operators, projection(高さバンド), costmap(3層+エゴ窓), barrier(SDF),
 sam3_segmenter) / control/(dynamics, cbf_qp, nominal, planner=A*) / theory/certificate /
 sim2d/(2D検証環境) / isaac/adapter / telemetry。
