@@ -13,6 +13,8 @@ core_safety/
   reasoning/
     prompt.py          VLM システムプロンプト (参照手法の Listing 1 準拠)
     vlm_client.py      OllamaVLM (gemma3:27b) / RuleBasedVLM (開発・ベースライン用)
+    goal_grounding.py  言語ゴール接地: VA bbox目測 + 深度 → 世界座標ゴール
+                       (訓練不要VLN参照手法のアイデアを自前実装)
   grounding/
     segmentation.py    Segmenter IF + 真値セグメンタ (2D sim / Isaac GT 用)
     sam3_segmenter.py  SAM3 (facebook/sam3, transformers) — Ubuntu GPU 用

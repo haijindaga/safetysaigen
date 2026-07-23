@@ -46,6 +46,28 @@ export PYTHONPATH=$PWD:$PYTHONPATH   # core_safety を import 可能に
 pip install "transformers>=5.0" accelerate
 ```
 
+SAM3 使用時の追加注意:
+- torchvision / torchaudio は **torch と同じバージョン・同じ CUDA タグ**
+  でなければならない。transformers は import 時に torchaudio を読むため、
+  CUDA 版ずれがあると `Sam3Model` の import ごと失敗する
+  (実例: torch 2.7.0+cu128 に対して torchaudio が cu126 →
+  "compiled with different CUDA versions" エラー)。
+  torch 2.7.0+cu128 の場合の修正コマンド:
+
+```bash
+pip install torchaudio==2.7.0 torchvision==0.22.0 \
+    --index-url https://download.pytorch.org/whl/cu128
+```
+
+  (torch 本体は再インストールされない。対応表: torch 2.5→tv 0.20 /
+  2.6→0.21 / 2.7→0.22 / 2.8→0.23。素の `pip install torchvision` は
+  最新版が torch を上書きするので**禁止**。)
+- pip が出す `isaacsim-kernel requires click==8.1.7` の警告は
+  huggingface_hub の依存によるもので、シミュレーション実行には無害。
+- 実行前に `ollama stop gemma3:27b` で VRAM を解放しておく
+  (デモからのリクエストは num_gpu=0 で CPU 実行されるが、
+  他経路でロードされた分は VRAM に残るため)。
+
 **警告**: この環境で `requirements.txt` (無印) を使ってはいけない。
 opencv 5 系が numpy 2.x を引き込み、Isaac の omni.graph が
 `Unable to write from unknown dtype` で壊れる (実際に発生した事例)。

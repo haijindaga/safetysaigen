@@ -77,6 +77,13 @@ parser.add_argument("--nominal", choices=["straight", "astar"],
 parser.add_argument("--mission", default="",
                     help="natural-language task passed to the VLM as context, "
                          "e.g. 'reach the green marker about 5 m ahead'")
+parser.add_argument("--target", default="",
+                    help="language goal grounding (LaViRA-style VA): describe "
+                         "the goal object, e.g. 'green goal marker'. The goal "
+                         "position starts UNKNOWN; on each thinking cycle a "
+                         "VA query boxes the target in the current view and "
+                         "bbox-bottom + depth ground it to a world goal. "
+                         "Requires --vlm ollama; --goal is ignored")
 parser.add_argument("--frame", choices=["ego", "world"], default="ego",
                     help="ego (default) = rolling 8x8 m robot-centered map "
                          "window (relative geometry only, natural forgetting); "
@@ -272,6 +279,19 @@ if args.vlm == "ollama":
 else:
     vlm = RuleBasedVLM(DEFAULT_RULEBOOK, contextual=True)
 
+# Language goal grounding (LaViRA-style VA): the goal starts unknown and is
+# grounded from a VA bounding box + depth. The VA proposes, the CBF still
+# arbitrates every command, so a hallucinated box cannot cause a collision.
+va_client = None
+if args.target:
+    if args.vlm == "ollama":
+        from core_safety.reasoning.goal_grounding import OllamaVA
+        va_client = OllamaVA(model=args.ollama_model,
+                             num_gpu=args.ollama_num_gpu)
+    else:
+        print("[goal-grounding] --target requires --vlm ollama; "
+              "the goal will never be grounded in rulebook mode")
+
 gt_segmenter = GroundTruthSegmenter()
 if args.segmenter == "sam3":
     from core_safety.grounding.sam3_segmenter import SAM3Segmenter
@@ -302,7 +322,21 @@ _busy = threading.Event()
 _state = {"last_perception": None,   # wall time of last completed cycle
           "last_vlm": None, "new_vlm": False, "stuck_since": None,
           "behavior": "-", "vlm_message": "",
-          "progress": "", "plan": "", "decisions": []}
+          "progress": "", "plan": "", "decisions": [],
+          # goal is dynamic: (x, y) tuple, or None while a --target has not
+          # been visually grounded yet
+          "goal": None if args.target else tuple(args.goal),
+          "va_reason": ""}
+
+
+def _current_goal():
+    """World goal as np.array, or None (no goal / target not grounded)."""
+    if args.no_goal:
+        return None
+    g = _state.get("goal")
+    return None if g is None else np.asarray(g, dtype=float)
+
+
 # Behavior-executor modifiers (extended reasoning mode).
 _mode = {"scan_until": 0.0, "slow_until": 0.0, "ask_until": 0.0,
          "invest": None, "invest_until": 0.0}
@@ -415,6 +449,42 @@ def _perception_worker():
                 _state["new_vlm"] = True
                 _state["cycle_s"] = _time.time() - t0
                 print(f"[perception] cycle {_state['cycle_s']:.1f}s")
+                # Piggyback the VA goal-grounding query on the thinking
+                # cycle: one extra VLM call, same frame. Re-grounds on
+                # every cycle so a mislocalized goal self-corrects.
+                if va_client is not None:
+                  try:
+                    from core_safety.reasoning.goal_grounding import \
+                        bbox_to_goal
+                    res = va_client.locate(frame["rgb"], args.target)
+                    _state["va_reason"] = res.reasoning
+                    if res.bbox_px is None:
+                        print(f"[goal-grounding] target not visible: "
+                              f"{res.reasoning}")
+                    else:
+                        goal = bbox_to_goal(
+                            res.bbox_px, frame["depth"], pipeline.camera,
+                            frame["pose"], min_range=0.15,
+                            max_range=cfg.max_range)
+                        if goal is None:
+                            print(f"[goal-grounding] bbox {res.bbox_px} "
+                                  "rejected (no depth / out of range / "
+                                  "contact point too high)")
+                        else:
+                            _state["goal"] = (float(goal[0]), float(goal[1]))
+                            print(f"[goal-grounding] '{args.target}' bbox "
+                                  f"{res.bbox_px} -> goal "
+                                  f"({goal[0]:+.2f},{goal[1]:+.2f})")
+                        x1, y1, x2, y2 = res.bbox_px
+                        ov = np.ascontiguousarray(
+                            frame["rgb"][:, :, ::-1]).copy()
+                        cv2.rectangle(ov, (x1, y1), (x2, y2),
+                                      (0, 255, 0), 2)
+                        cv2.imwrite(str(
+                            DEBUG_DIR / f"{_time.strftime('%H%M%S')}_va.png"),
+                            ov)
+                  except Exception as e:   # goal grounding is best-effort
+                    print(f"[goal-grounding] VA query failed: {e}")
             _dump_debug(frame)
         except Exception as e:      # keep last good barrier on any failure
             print(f"[perception] update failed: {e}")
@@ -517,8 +587,7 @@ try:
                            or stuck)
                 job = "vlm" if trigger else "ground"
                 if job == "vlm":
-                    d_goal = float(np.linalg.norm(
-                        base.state[:2] - np.asarray(args.goal)))
+                    _g = _current_goal()
                     mission = (f"MISSION: {args.mission}. "
                                if args.mission else "")
                     if args.no_goal:
@@ -533,15 +602,25 @@ try:
                         mission += ("YOUR RECENT DECISIONS: "
                                     + "; ".join(_state["decisions"][-3:])
                                     + ". ")
-                    brg = np.degrees(
-                        np.arctan2(args.goal[1] - base.state[1],
-                                   args.goal[0] - base.state[0])
-                        - base.state[2])
+                    if _g is not None:
+                        d_goal = float(np.linalg.norm(base.state[:2] - _g))
+                        brg = np.degrees(
+                            np.arctan2(_g[1] - base.state[1],
+                                       _g[0] - base.state[0])
+                            - base.state[2])
+                        goal_txt = (f"goal {d_goal:.1f} m at bearing "
+                                    f"{brg:+.0f} deg; ")
+                    elif args.target:
+                        goal_txt = (f"goal position UNKNOWN: the target "
+                                    f"'{args.target}' has not been seen yet "
+                                    "— explore (STOP_AND_SCAN/INVESTIGATE) "
+                                    "until it becomes visible; ")
+                    else:
+                        goal_txt = ""
                     fr = pipeline.nearest_frontier(base.state[0], base.state[1])
                     fr_txt = ("none mapped yet" if fr is None else
                               f"{np.linalg.norm(fr - base.state[:2]):.1f} m away")
-                    context = (mission +
-                               f"goal {d_goal:.1f} m at bearing {brg:+.0f} deg; "
+                    context = (mission + goal_txt +
                                f"unexplained visual novelty "
                                f"{pipeline.debug.novelty:.0%}; "
                                f"robot currently blocked by safety filter: "
@@ -564,14 +643,21 @@ try:
     import time as _time
     _now = _time.time()
     # ---- nominal planner: A* replanning on the costmap -------------------
-    if (args.nominal == "astar" and not args.no_goal
+    _goal_now = _current_goal()
+    if (args.nominal == "astar" and _goal_now is not None
             and step % 120 == 0
             and pipeline.barrier is not None):
         path = plan_path(pipeline.costmap,
-                         (base.state[0], base.state[1]), tuple(args.goal))
+                         (base.state[0], base.state[1]), tuple(_goal_now))
         if path:
             nominal = WaypointFollower(path, v_max=cfg.v_max,
                                        omega_max=cfg.omega_max)
+    elif (args.nominal == "straight" and _goal_now is not None
+          and _state.get("nominal_goal") != tuple(_goal_now)):
+        # straight mode: rebuild the follower when VA re-grounds the goal
+        nominal = WaypointFollower([tuple(_goal_now)], v_max=cfg.v_max,
+                                   omega_max=cfg.omega_max)
+        _state["nominal_goal"] = tuple(_goal_now)
     # ---- behavior executor (extended reasoning) --------------------------
     if args.reasoning == "extended" and _state.pop("new_vlm", False):
         c = pipeline.debug.constraints
@@ -609,8 +695,14 @@ try:
         _mode["invest"] = None
         inv = None
 
-    u_nom = inv.compute(base.state) if inv is not None \
-        else nominal.compute(base.state)
+    if inv is not None:
+        u_nom = inv.compute(base.state)
+    elif _goal_now is None:
+        # no goal yet (--no-goal, or --target not grounded): motion comes
+        # only from the VLM behaviors above
+        u_nom = np.zeros(3)
+    else:
+        u_nom = nominal.compute(base.state)
     # Safe initialization: no motion until the first barrier is grounded
     # (Assumption 1). With slow perception, --max-barrier-age also enforces
     # the paper's stop-start regime instead of the continuous-motion
@@ -647,12 +739,15 @@ try:
     world.step(render=True)
     if step % 60 == 0:
         import time as _time
-        d_goal = float(np.linalg.norm(base.state[:2] - np.asarray(args.goal)))
+        _g = _current_goal()
+        d_goal = (None if _g is None
+                  else float(np.linalg.norm(base.state[:2] - _g)))
         cs = _state.get("cycle_start")
         wait = f" perceiving={_time.time()-cs:4.0f}s" if cs else ""
+        d_txt = "?" if d_goal is None else f"{d_goal:.2f}"
         print(f"t={step*PHYSICS_DT:5.1f}s pos=({base.state[0]:+.2f},"
               f"{base.state[1]:+.2f}) h={pipeline.debug.h:6.2f} "
-              f"filtered={pipeline.debug.filtered} d_goal={d_goal:.2f}{wait}")
+              f"filtered={pipeline.debug.filtered} d_goal={d_txt}{wait}")
         try:                       # live camera view (not cycle-bound)
             import cv2
             _fr = camera.get_current_frame()
@@ -701,7 +796,11 @@ try:
             model=(args.ollama_model if args.vlm == "ollama" else "-"),
             segmenter=args.segmenter, v_max=base.v_max,
             max_barrier_age=args.max_barrier_age,
-            perception_every=args.perception_every)
+            perception_every=args.perception_every,
+            target=args.target or None,
+            goal=(None if _state.get("goal") is None
+                  else [round(v, 2) for v in _state["goal"]]),
+            va_reason=_state.get("va_reason", ""))
         p = telemetry.read_params()
         if "v_max" in p:
             base.v_max = nominal.v_max = float(p["v_max"])
@@ -713,7 +812,7 @@ try:
             pipeline.costmap.tau = float(p["tau"])
         if "costmap_decay" in p:
             pipeline.cfg.costmap_decay = float(p["costmap_decay"])
-        if d_goal < 0.25:
+        if d_goal is not None and d_goal < 0.25:
             print("reached goal")
             break
     step += 1
