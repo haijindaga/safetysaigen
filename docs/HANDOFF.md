@@ -30,17 +30,27 @@ behavior実行器: PROCEED / SLOW(v半減) / STOP_AND_SCAN(その場360°回転)
 INVESTIGATE(最寄りフロンティア=安全セルと未知の境界へ移動) / ASK_HUMAN(30秒停止+
 ダッシュボードに質問表示)。**どのbehaviorでも最終速度指令は必ずCBFを通る。**
 
-**第3モード `--reasoning lavira`(2026-07-23, LaViRA/Uni-LaViRAのアイデアを自前実装)**:
-LA/VA/RAの3段翻訳ループ。①パノラマ(その場回転、90°ごと4枚=FOV90°で360°タイル)
-②LA(4枚+MISSION+markdown TODOリスト+履歴→TODO更新+NAVIGATE/STOPと方向1つ+
-「その視界に実際に見えるランドマーク」1つ)③選択方向へ回頭④VA(1枚でランドマークに
-bbox→bbox下端+深度でサブゴール接地)⑤A*でサブゴール走行(到達0.3m/45sタイムアウトで
-①へ)。終了はLAのSTOP判断。VA接地3連敗でフロンティアへのフォールバック。
-狙い: 「見えないゴール」を「見える中間ランドマークの連鎖」に変換する
-(extendedのSTOP_AND_SCAN/INVESTIGATEは無方向でコーン裏のゴール等に構造的に弱い)。
-安全層(SAM3監視+占有/ゾーン地図+CBF+e-stop)は完全共有・不変で、安全用VLM呼び出しは
-faithfulプロンプトでextended同様のイベント駆動。**LaViRA単体(安全なし思想)を
-我々のCBF層が包む構成のablationが `--reasoning lavira` vs `extended` の1フラグで可能。**
+**第3モード `--reasoning lavira`(2026-07-23, Uni-LaViRA実機版の忠実ポート)**:
+LA/VA/RAの3段翻訳ループ。①パノラマ(その場回転、90°ごと4枚=FOV90°で360°タイル。
+habitat版と同じ4方向)②初回のみ初期TODO生成(パノラマ→markdownチェックリストのみ
+返す専用呼び出し)③LA(4枚+任務+TODO+「Step i: 進捗->目標物」履歴→
+progress_analysis/reasoning/updated_todo_list/action/turn_direction/
+expected_landmarkのJSON。失敗時はNAVIGATE/right/"open space"にフォールバック)
+④選択方向へ回頭⑤VA(1枚+任務+進捗+目標→NAVIGATE/STOP+bbox_2d。
+[0,1000]正規化ならピクセルに変換(max<=1000ヒューリスティック))
+⑥ナビ画素=bbox下端中央、**bboxなしなら画像中央**→深度小窓median、
+**深度なしなら正面1.0m**→世界座標サブゴール⑦A*で走行(0.3m到達/45sで①へ)。
+終了=LAのSTOP、またはVAのSTOP(到達宣言)。
+**設計原則(本家準拠): 毎サイクル必ずどこかへ動く。不確実=「動いて見直す」であり
+「停止」ではない。衝突安全はCBF層の仕事。** 2026-07-23の実走で判明した教訓:
+初期実装の幻覚ガード(visible自己申告/深度範囲棄却/接地点高さゲート/3連敗退避)は
+不確実性を全て停止に変換し「回転するが一向に進まない」を起こした→全廃した。
+(これらのガードはextendedの--target用goal_grounding.pyには残存。あちらは
+固定ゴール向けで誤接地ゴールが長時間残るため妥当。)
+プロンプトは構造・JSONキー・フォールバック値を本家と一致させ、文言のみ自前
+(CC BY-NC-SA逐語コピー回避)。LA/VAは1モデル兼任(本家のllama-server単一構成)。
+安全層(SAM3監視+占有/ゾーン地図+CBF+e-stop)は完全共有・不変、安全用VLMは
+faithfulプロンプトでイベント駆動。**ablation: lavira vs extendedが1フラグ。**
 状態機械はisaac_mobile_demoの_lavira_tick(panorama/la_wait/turn/va_wait/drive)。
 
 ## 3. 数理(勉強用)

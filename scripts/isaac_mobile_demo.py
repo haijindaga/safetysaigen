@@ -293,7 +293,7 @@ else:
 # grounded from a VA bounding box + depth. The VA proposes, the CBF still
 # arbitrates every command, so a hallucinated box cannot cause a collision.
 va_client = None
-if args.target or args.reasoning == "lavira":
+if args.target and args.reasoning != "lavira":
     if args.vlm == "ollama":
         from core_safety.reasoning.goal_grounding import OllamaVA
         va_client = OllamaVA(model=args.ollama_model,
@@ -302,12 +302,12 @@ if args.target or args.reasoning == "lavira":
         print("[goal-grounding] --target requires --vlm ollama; "
               "the goal will never be grounded in rulebook mode")
 
-# LaViRA mode: strategic LA layer (panorama -> TODO + direction).
+# LaViRA mode: one model serves LA and VA (upstream's single-server setup).
 la_client = None
 if args.reasoning == "lavira":
-    from core_safety.reasoning.lavira import OllamaLA
-    la_client = OllamaLA(model=args.ollama_model,
-                         num_gpu=args.ollama_num_gpu)
+    from core_safety.reasoning.lavira import OllamaLaViRA
+    la_client = OllamaLaViRA(model=args.ollama_model,
+                             num_gpu=args.ollama_num_gpu)
 
 gt_segmenter = GroundTruthSegmenter()
 if args.segmenter == "sam3":
@@ -363,8 +363,9 @@ _mode = {"scan_until": 0.0, "slow_until": 0.0, "ask_until": 0.0,
 _lav = {"state": "panorama",   # panorama|la_wait|turn|va_wait|drive
         "pano": [],            # captured views, VIEW_ORDER order
         "start_yaw": 0.0, "started": False,
-        "todo": "", "history": [], "turn_to": 0.0,
-        "landmark": "", "va_retry": 0, "drive_since": 0.0}
+        "todo": "", "steps": [],   # markdown TODO + Step-i history (upstream)
+        "progress": "", "turn_to": 0.0,
+        "landmark": "", "drive_since": 0.0}
 
 
 def _wrap_pi(a: float) -> float:
@@ -479,9 +480,16 @@ def _perception_worker():
             if "labels" in frame:
                 gt_segmenter.update(frame["labels"], frame["id_to_name"])
             if frame.get("job") == "la":
-                # LaViRA strategic layer: 4-view panorama -> TODO + direction
+                # LaViRA strategic layer. First cycle: generate the initial
+                # TODO checklist from the starting panorama (one-shot,
+                # upstream flow), then the strategic decision reuses it.
+                todo = frame["la_todo"]
+                if not todo:
+                    todo = la_client.initial_todo(frame["pano"],
+                                                  frame["la_mission"])
+                    print(f"[la] initial TODO:\n{todo}")
                 res = la_client.decide(frame["pano"], frame["la_mission"],
-                                       frame["la_todo"], frame["la_history"])
+                                       todo, frame["la_steps"])
                 _state["la_result"] = res
                 print(f"[la] {_time.time()-t0:.1f}s action={res.action} "
                       f"dir={res.direction} landmark='{res.expected_landmark}'"
@@ -493,26 +501,39 @@ def _perception_worker():
                                     f"{_time.strftime('%H%M%S')}_pano{i}.png"),
                                 np.ascontiguousarray(v[:, :, ::-1]))
             elif frame.get("job") == "va_sub":
-                # LaViRA tactical layer: box the LA landmark -> subgoal
-                from core_safety.reasoning.goal_grounding import bbox_to_goal
-                res = va_client.locate(frame["rgb"], frame["va_target"])
-                _state["va_reason"] = res.reasoning
-                sub = None
+                # LaViRA tactical layer: STOP, or a bbox -> nav pixel ->
+                # world goal. Always yields a goal (bbox missing -> image
+                # center; depth missing -> 1 m ahead): upstream behaviour,
+                # the robot moves every cycle and the CBF owns safety.
+                from core_safety.reasoning.lavira import (nav_pixel,
+                                                          pixel_to_goal)
+                res = la_client.locate(frame["rgb"], frame["va_mission"],
+                                       frame["va_progress"],
+                                       frame["va_target"])
+                _state["va_reason"] = res.visual_check or res.stop_reasoning
+                if res.action == "STOP":
+                    _state["va_goal"] = "STOP"
+                    print(f"[va] {_time.time()-t0:.1f}s STOP — "
+                          f"{res.stop_reasoning}")
+                else:
+                    h_i, w_i = frame["rgb"].shape[:2]
+                    u, v = nav_pixel(res.bbox_px, w_i, h_i)
+                    g = pixel_to_goal(u, v, frame["depth"],
+                                      pipeline.camera, frame["pose"])
+                    _state["va_goal"] = (float(g[0]), float(g[1]))
+                    _state["va_step"] = {"description": frame["va_progress"],
+                                         "target": res.target
+                                         or frame["va_target"]}
+                    print(f"[va] {_time.time()-t0:.1f}s "
+                          f"'{frame['va_target']}' bbox={res.bbox_px} "
+                          f"px=({u},{v}) goal=({g[0]:+.2f},{g[1]:+.2f}) — "
+                          f"{res.visual_check}")
                 if res.bbox_px is not None:
-                    g = bbox_to_goal(res.bbox_px, frame["depth"],
-                                     pipeline.camera, frame["pose"],
-                                     min_range=0.15, max_range=cfg.max_range)
-                    if g is not None:
-                        sub = (float(g[0]), float(g[1]))
                     x1, y1, x2, y2 = res.bbox_px
                     ov = np.ascontiguousarray(frame["rgb"][:, :, ::-1]).copy()
                     cv2.rectangle(ov, (x1, y1), (x2, y2), (0, 255, 0), 2)
                     cv2.imwrite(str(
                         DEBUG_DIR / f"{_time.strftime('%H%M%S')}_va.png"), ov)
-                _state["va_goal"] = sub if sub is not None else False
-                print(f"[va] {_time.time()-t0:.1f}s "
-                      f"'{frame['va_target']}' bbox={res.bbox_px} "
-                      f"subgoal={sub} — {res.reasoning}")
             elif frame.get("job") == "ground":
                 pipeline.update_grounding(frame["rgb"], frame["depth"],
                                           frame["pose"])
@@ -606,7 +627,7 @@ def _lavira_tick(u_nom, now):
                     _latest.update(job="la", pano=list(_lav["pano"]),
                                    la_mission=mission,
                                    la_todo=_lav["todo"],
-                                   la_history=list(_lav["history"]))
+                                   la_steps=list(_lav["steps"]))
                 _busy.set()
                 _lav["state"] = "la_wait"
             return np.zeros(3)
@@ -625,14 +646,12 @@ def _lavira_tick(u_nom, now):
             return np.zeros(3)
         res = _state.pop("la_result")
         _lav["todo"] = res.updated_todo or _lav["todo"]
+        _lav["progress"] = res.progress_analysis
         if res.action == "STOP":
             _state["mission_done"] = True
             return np.zeros(3)
         _lav["landmark"] = (res.expected_landmark or args.target
                            or args.mission)
-        _lav["history"].append(
-            f"went {res.direction} toward '{_lav['landmark']}'")
-        _lav["history"] = _lav["history"][-8:]
         _lav["turn_to"] = _wrap_pi(_lav["start_yaw"]
                                    + DIRECTIONS[res.direction])
         _lav["state"] = "turn"
@@ -646,10 +665,13 @@ def _lavira_tick(u_nom, now):
         if not _busy.is_set():
             g = _grab_rgbd()
             if g is not None:
+                mission = args.mission or f"find and reach: {args.target}"
                 with _lock:
                     _latest.clear()
                     _latest.update(job="va_sub", rgb=g[0], depth=g[1],
                                    pose=base.state.copy(),
+                                   va_mission=mission,
+                                   va_progress=_lav["progress"],
                                    va_target=_lav["landmark"])
                 _busy.set()
                 _lav["state"] = "va_wait"
@@ -657,24 +679,17 @@ def _lavira_tick(u_nom, now):
 
     if st == "va_wait":
         if "va_goal" not in _state:
-            if not _busy.is_set():        # worker errored: count as a miss
-                _state["va_goal"] = False
+            if not _busy.is_set():        # worker errored: re-ask the VA
+                _lav["state"] = "turn"
             return np.zeros(3)
         sub = _state.pop("va_goal")
-        if sub is False:                  # landmark not visible/groundable
-            _lav["va_retry"] += 1
-            _lav["history"].append(
-                f"could not ground '{_lav['landmark']}'")
-            if _lav["va_retry"] >= 3:     # stuck: go look at new space
-                fr = pipeline.nearest_frontier(base.state[0], base.state[1])
-                if fr is not None:
-                    print("[lavira] 3 VA misses -> frontier fallback")
-                    _state["goal"] = (float(fr[0]), float(fr[1]))
-                    _lav.update(state="drive", drive_since=now, va_retry=0)
-                    return u_nom
-            _lav.update(state="panorama", started=False)
+        if sub == "STOP":                 # VA declares the target reached
+            _state["mission_done"] = True
             return np.zeros(3)
-        _lav["va_retry"] = 0
+        step_rec = _state.pop("va_step", None)
+        if step_rec is not None:          # upstream Step-i history entry
+            _lav["steps"].append(step_rec)
+            _lav["steps"] = _lav["steps"][-10:]
         _state["goal"] = sub
         _lav.update(state="drive", drive_since=now)
         print(f"[lavira] driving to subgoal ({sub[0]:+.2f},{sub[1]:+.2f})")
@@ -685,8 +700,6 @@ def _lavira_tick(u_nom, now):
     reached = (g is not None
                and float(np.linalg.norm(base.state[:2] - g)) < 0.3)
     if reached or now - _lav["drive_since"] > 45.0:
-        _lav["history"].append("reached subgoal" if reached
-                               else "subgoal timed out")
         print(f"[lavira] {'subgoal reached' if reached else 'subgoal timeout'}"
               " -> next cycle")
         _state["goal"] = None

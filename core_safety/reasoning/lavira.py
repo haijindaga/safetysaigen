@@ -1,21 +1,25 @@
-"""LaViRA-mode strategic layer (LA): panorama -> TODO checklist + direction.
+"""LaViRA-mode reasoning: faithful port of the Uni-LaViRA LA/VA contract.
 
-Own implementation of the Language Action stage of LaViRA / Uni-LaViRA
-(Ding et al., arXiv:2510.19655 / 2605.27582), no upstream code copied.
-The full mode is a three-stage translation, run as a repeated cycle:
+Structure, JSON fields, fallbacks, and control flow mirror the upstream
+real-robot pipeline (Ding et al., arXiv:2510.19655 / 2605.27582) as closely
+as our platform allows; the prompt WORDING is our own (the upstream code is
+CC BY-NC-SA, so nothing is copied verbatim). Platform adaptations, kept
+deliberately minimal:
 
-  LA (this module):  4 panoramic views (90-deg increments, matching the
-                     camera's 90-deg FOV) + mission + markdown TODO list +
-                     history -> updated TODO, NAVIGATE/STOP, one direction,
-                     and ONE landmark that is VISIBLE in the chosen view.
-  VA (goal_grounding): boxes that landmark in the current view; bbox
-                     bottom-center + depth -> one world-frame subgoal.
-  RA (existing stack): A* drives to the subgoal, CBF-QP arbitrates every
-                     command. Safety layers are untouched by this mode.
+  - 4 panoramic views at 90-deg increments (the habitat variant's layout;
+    the real robot sweeps 7 views with its arms, which we cannot do) ->
+    directions are front / left / back / right.
+  - RA is our A* + CBF stack instead of iPlanner. The CBF arbitrates every
+    command; LaViRA itself ships no safety layer.
 
-The point of LA: a goal that is NOT visible (e.g. hidden behind an obstacle
-row) becomes a chain of visible intermediate landmarks, instead of the
-undirected STOP_AND_SCAN/INVESTIGATE wandering of extended mode.
+The key upstream property this port preserves: EVERY cycle produces a
+motion target. No bbox -> use the image center pixel; no valid depth ->
+assume 1.0 m straight ahead. Uncertainty means "move and look again",
+never "freeze". (Collision safety is the CBF's job, not the planner's.)
+
+Memory, as upstream: a markdown TODO checklist created once from the
+starting panorama and rewritten by every strategic call, plus a
+"Step i: <progress> -> <target>" navigation history.
 """
 from __future__ import annotations
 
@@ -25,8 +29,9 @@ from dataclasses import dataclass
 
 import numpy as np
 
-# View/direction layout, counter-clockwise from the current heading. The
-# panorama is captured in this order; "left" is +90 deg (CCW positive).
+from ..grounding.projection import PinholeCamera
+
+# View/direction layout, counter-clockwise from the current heading.
 DIRECTIONS: dict[str, float] = {
     "front": 0.0,
     "left": np.pi / 2,
@@ -35,95 +40,244 @@ DIRECTIONS: dict[str, float] = {
 }
 VIEW_ORDER = ("front", "left", "back", "right")
 
-LA_ACTIONS = ("NAVIGATE", "STOP")
-
-LA_SYSTEM_PROMPT = """You are the strategic navigator of a mobile robot.
-Each cycle you receive 4 panoramic views taken from the robot's current
-position (in this order: 1=front 0 deg, 2=left +90 deg, 3=back 180 deg,
-4=right -90 deg), the MISSION, your own TODO checklist from the previous
-cycle, and the recent navigation history.
-
-Your tasks:
-1. Update the TODO checklist. Markdown format, one item per line:
-   "- [ ] pending step" / "- [x] completed step". Keep it short and
-   concrete; refine it when the scene reveals new information (e.g. an
-   obstacle row that must be bypassed becomes its own step).
-2. Decide the next action:
-   - "NAVIGATE": keep going. Pick the ONE view direction that best
-     advances the mission, and name ONE landmark that is ACTUALLY VISIBLE
-     in that view for the robot to drive toward. If the mission target is
-     not visible in any view, pick an intermediate landmark that will
-     reveal new space (e.g. "the open floor beyond the right end of the
-     shelf row"). Never name something you cannot see.
-   - "STOP": the mission is complete (the robot is at the target).
-
-Respond with a single flat JSON object and nothing else:
-{
-"updated_todo": "- [x] ...\\n- [ ] ...",
-"action": "NAVIGATE" or "STOP",
-"direction": "front" | "left" | "back" | "right",
-"expected_landmark": "short description of one visible landmark",
-"reasoning": "one or two sentences"
-}"""
+_VIEW_LIST = "front(0 deg), left(+90 deg), back(180 deg), right(-90 deg)"
 
 
-def la_user_prompt(mission: str, todo: str, history: list[str]) -> str:
-    """User message accompanying the 4 panorama images (in VIEW_ORDER)."""
-    hist = "\n".join(f"- {h}" for h in history[-6:]) if history else "(none)"
-    return (f'MISSION: "{mission}"\n\n'
-            f"CURRENT TODO LIST:\n{todo or '(first cycle: create it)'}\n\n"
-            f"NAVIGATION HISTORY (most recent last):\n{hist}\n\n"
-            "The 4 images are attached in order: 1=front(0 deg), "
-            "2=left(+90 deg), 3=back(180 deg), 4=right(-90 deg).\n"
-            "Update the TODO list and output the JSON.")
+# --------------------------------------------------------------------------
+# Prompt builders (own wording, upstream structure)
+# --------------------------------------------------------------------------
 
+def initial_todo_prompt(instruction: str) -> str:
+    """Leading text of the one-shot initial TODO generation (before frames)."""
+    return (f'Instruction: "{instruction}"\n\n'
+            "The attached images are panoramic views from the starting "
+            f"position, in this order: {_VIEW_LIST}.")
+
+
+def initial_todo_suffix() -> str:
+    """Trailing directive of the initial TODO generation (after frames)."""
+    return ("Write a dynamic checklist of steps to carry out the "
+            "instruction.\n"
+            "Markdown format, one item per line: - [ ] step description\n"
+            "Return ONLY the checklist, no JSON, no other text.")
+
+
+def history_text(steps: list[dict]) -> str:
+    """Navigation-history block: 'Step i: <description> -> <target>'."""
+    out = "Navigation History:\n"
+    if steps:
+        for i, s in enumerate(steps, 1):
+            out += (f"Step {i}: {s.get('description', 'Unknown')} "
+                    f"-> {s.get('target', 'Unknown')}\n")
+    else:
+        out += "No history yet.\n"
+    return out
+
+
+def strategic_task_text(instruction: str, steps: list[dict]) -> str:
+    """Task + history text placed BEFORE the panorama frames (LA call)."""
+    return (f'Navigation Task: "{instruction}"\n\n'
+            f"History:\n{history_text(steps)}")
+
+
+def strategic_prompt(instruction: str, todo: str) -> str:
+    """Strategic decision body placed AFTER the panorama frames (LA call)."""
+    return f"""
+**ROLE**: You are the robot's strategic navigator.
+**MISSION**: "{instruction}"
+
+**Current TODO List**:
+{todo}
+
+**Available directions**: {_VIEW_LIST}
+(the images are attached in that order)
+
+**Your tasks**:
+1. Update the TODO list: mark finished items [x].
+2. Pick the next action:
+   - NAVIGATE while navigation steps remain
+   - STOP once every step is finished
+
+**Reply with one JSON object** (no markdown, nothing else):
+{{
+    "progress_analysis": "...(30 words or fewer)...",
+    "reasoning": "...(1-2 sentences)...",
+    "updated_todo_list": "...",
+    "action": "NAVIGATE" | "STOP",
+    "turn_direction": "front|left|back|right",
+    "expected_landmark": "..."
+}}
+"""
+
+
+def tactical_prompt(instruction: str, progress: str, target: str,
+                    width: int, height: int) -> str:
+    """Tactical bbox body placed after the current-view image (VA call)."""
+    return f"""
+**ROLE**: You are the robot's tactical eyes.
+**MISSION**: "{instruction}"
+**PROGRESS**: "{progress}"
+**CURRENT TARGET**: "{target}"
+
+Find the target described above in the image.
+Coordinates are pixels in [0..{width}, 0..{height}].
+
+JSON:
+{{
+    "visual_check": "I see ...",
+    "action": "NAVIGATE" | "STOP",
+    "bbox_2d": [x1, y1, x2, y2],
+    "target": "object name",
+    "stop_reasoning": "..."
+}}
+"""
+
+
+# --------------------------------------------------------------------------
+# Output parsing (upstream fallbacks preserved)
+# --------------------------------------------------------------------------
 
 @dataclass
 class LAResult:
-    ok: bool                      # False = fallback (parse/model failure)
+    ok: bool                      # False = model/parse failure (fallback)
     action: str                   # NAVIGATE | STOP
     direction: str                # key of DIRECTIONS
     expected_landmark: str
     updated_todo: str
+    progress_analysis: str = ""
     reasoning: str = ""
 
 
-def parse_la_output(text: str, prev_todo: str = "") -> LAResult:
-    """Parse the LA JSON reply; degrade to a safe NAVIGATE/front fallback.
-
-    LA failures must never raise into the control loop: the fallback keeps
-    the previous TODO list and sends the robot to look front, where the
-    VA "not visible" path or the next panorama recovers.
-    """
-    fallback = LAResult(False, "NAVIGATE", "front", "", prev_todo,
-                        "LA output unusable")
-    match = re.search(r"\{.*\}", text, re.DOTALL)
-    if match is None:
-        return fallback
+def _extract_json(text: str) -> dict | None:
+    """Fenced ```json block first, else outermost braces (upstream order)."""
+    m = re.search(r"```(?:json)?\s*\n?((?:.|\n)*?)\s*```", text, re.DOTALL)
+    raw = m.group(1) if m else None
+    if raw is None:
+        s, e = text.find("{"), text.rfind("}")
+        if s != -1 and e != -1:
+            raw = text[s:e + 1]
+    if raw is None:
+        return None
     try:
-        obj = json.loads(re.sub(r",\s*([}\]])", r"\1", match.group(0)))
+        return json.loads(re.sub(r",\s*([}\]])", r"\1", raw.strip()))
     except json.JSONDecodeError:
+        return None
+
+
+def parse_la_output(text: str, prev_todo: str = "") -> LAResult:
+    """Parse the strategic reply; upstream fallback = NAVIGATE / right /
+    'open space' with the TODO list left unchanged."""
+    fallback = LAResult(False, "NAVIGATE", "right", "open space", prev_todo,
+                        "Fallback", "Model error")
+    obj = _extract_json(text)
+    if obj is None:
         return fallback
     action = str(obj.get("action", "")).strip().upper()
-    if action not in LA_ACTIONS:
+    if action not in ("NAVIGATE", "STOP"):
         action = "NAVIGATE"
-    direction = str(obj.get("direction", "")).strip().lower()
+    direction = str(obj.get("turn_direction", "")).strip().lower()
     if direction not in DIRECTIONS:
-        direction = "front"
-    todo = str(obj.get("updated_todo", "")).strip() or prev_todo
+        direction = "right"
+    todo = str(obj.get("updated_todo_list", "")).strip() or prev_todo
     return LAResult(
-        ok=True,
-        action=action,
-        direction=direction,
-        expected_landmark=str(obj.get("expected_landmark", "")).strip(),
+        ok=True, action=action, direction=direction,
+        expected_landmark=str(obj.get("expected_landmark", "")).strip()
+        or "open space",
         updated_todo=todo,
+        progress_analysis=str(obj.get("progress_analysis", "")),
         reasoning=str(obj.get("reasoning", "")),
     )
 
 
-class OllamaLA:
-    """One LA decision per call: 4 panorama images -> LAResult."""
+@dataclass
+class VAResult:
+    action: str                          # NAVIGATE | STOP
+    bbox_px: tuple[int, int, int, int] | None
+    target: str = ""
+    stop_reasoning: str = ""
+    visual_check: str = ""
 
+
+def parse_va_output(text: str, width: int, height: int) -> VAResult:
+    """Parse the tactical reply and normalise the bbox to pixels.
+
+    Upstream heuristic kept as-is: coordinates whose maximum is <= 1000
+    are treated as Qwen-style [0, 1000]-normalized and rescaled. A missing
+    or malformed bbox is NOT an error: the caller falls back to the image
+    center (the robot still moves)."""
+    obj = _extract_json(text)
+    if obj is None:
+        return VAResult("NAVIGATE", None)
+    action = str(obj.get("action", "")).strip().upper()
+    if action not in ("NAVIGATE", "STOP"):
+        action = "NAVIGATE"
+    bbox_px = None
+    b = obj.get("bbox_2d")
+    if isinstance(b, (list, tuple)) and len(b) == 4:
+        try:
+            b = [float(v) for v in b]
+            if max(b) <= 1000:                    # [0,1000] -> pixels
+                b = [b[0] / 1000 * width, b[1] / 1000 * height,
+                     b[2] / 1000 * width, b[3] / 1000 * height]
+            bbox_px = (int(max(0, min(width, b[0]))),
+                       int(max(0, min(height, b[1]))),
+                       int(max(0, min(width, b[2]))),
+                       int(max(0, min(height, b[3]))))
+        except (TypeError, ValueError):
+            bbox_px = None
+    return VAResult(action=action, bbox_px=bbox_px,
+                    target=str(obj.get("target", "")),
+                    stop_reasoning=str(obj.get("stop_reasoning", "")),
+                    visual_check=str(obj.get("visual_check", "")))
+
+
+# --------------------------------------------------------------------------
+# RA grounding: nav pixel -> world goal (always succeeds, as upstream)
+# --------------------------------------------------------------------------
+
+def nav_pixel(bbox_px: tuple[int, int, int, int] | None,
+              width: int, height: int) -> tuple[int, int]:
+    """Navigation pixel: bbox bottom-center, else the image center."""
+    if bbox_px is not None:
+        x1, y1, x2, y2 = bbox_px
+        if x2 > x1 and y2 > y1:
+            return int((x1 + x2) / 2), int(y2)
+    return width // 2, height // 2
+
+
+def pixel_to_goal(u: int, v: int, depth: np.ndarray | None,
+                  cam: PinholeCamera, robot_pose: np.ndarray,
+                  window: int = 7) -> np.ndarray:
+    """Project one pixel + median window depth into a world (x, y) goal.
+
+    Never fails: with no valid depth the goal defaults to 1.0 m straight
+    ahead (upstream behaviour) — a wrong-but-moving guess beats freezing,
+    and the CBF layer owns collision safety anyway."""
+    d = None
+    if depth is not None and depth.size:
+        h, w = depth.shape[:2]
+        u = int(np.clip(u, 0, w - 1))
+        v = int(np.clip(v, 0, h - 1))
+        r = window // 2
+        patch = depth[max(0, v - r):min(h, v + r + 1),
+                      max(0, u - r):min(w, u + r + 1)]
+        finite = patch[np.isfinite(patch) & (patch > 0)]
+        if finite.size:
+            d = float(np.median(finite))
+    x, y, th = robot_pose
+    fwd = np.array([np.cos(th), np.sin(th)])
+    if d is None:
+        return np.array([x, y]) + 1.0 * fwd
+    xc = d * (u - cam.cx) / cam.fx            # camera x: right
+    right = np.array([np.sin(th), -np.cos(th)])
+    return np.array([x, y]) + d * fwd + xc * right
+
+
+# --------------------------------------------------------------------------
+# Ollama client (LA + VA share one model, as upstream's llama-server)
+# --------------------------------------------------------------------------
+
+class OllamaLaViRA:
     def __init__(self, model: str = "gemma3:27b",
                  host: str = "http://localhost:11434",
                  timeout: float = 600.0, num_gpu: int | None = None):
@@ -133,27 +287,50 @@ class OllamaLA:
         self.num_gpu = num_gpu
         self.last_raw: str | None = None
 
-    def decide(self, views: list[np.ndarray], mission: str,
-               todo: str, history: list[str]) -> LAResult:
+    def _chat(self, text: str, images: list[np.ndarray],
+              temperature: float = 0.0) -> str:
         import requests
         from .vlm_client import OllamaVLM
-        options: dict = {"temperature": 0.0}
+        options: dict = {"temperature": temperature}
         if self.num_gpu is not None:
             options["num_gpu"] = self.num_gpu
         payload = {
             "model": self.model,
             "stream": False,
             "options": options,
-            "messages": [
-                {"role": "system", "content": LA_SYSTEM_PROMPT},
-                {"role": "user",
-                 "content": la_user_prompt(mission, todo, history),
-                 "images": [OllamaVLM._encode_image(v) for v in views]},
-            ],
+            "messages": [{"role": "user", "content": text,
+                          "images": [OllamaVLM._encode_image(i)
+                                     for i in images]}],
         }
         r = requests.post(f"{self.host}/api/chat", json=payload,
                           timeout=self.timeout)
         if r.status_code >= 400:
             raise RuntimeError(f"Ollama HTTP {r.status_code}: {r.text[:300]}")
         self.last_raw = r.json()["message"]["content"]
-        return parse_la_output(self.last_raw, prev_todo=todo)
+        return self.last_raw
+
+    def initial_todo(self, views: list[np.ndarray], instruction: str) -> str:
+        """One-shot initial checklist from the starting panorama."""
+        text = (initial_todo_prompt(instruction) + "\n\n"
+                + initial_todo_suffix())
+        return self._chat(text, views, temperature=0.1).strip()
+
+    def decide(self, views: list[np.ndarray], instruction: str,
+               todo: str, steps: list[dict]) -> LAResult:
+        """Strategic decision (LA): direction / STOP + TODO rewrite."""
+        text = (strategic_task_text(instruction, steps) + "\n"
+                + strategic_prompt(instruction, todo))
+        try:
+            return parse_la_output(self._chat(text, views), prev_todo=todo)
+        except Exception:            # network/model error -> upstream fallback
+            return parse_la_output("", prev_todo=todo)
+
+    def locate(self, rgb: np.ndarray, instruction: str, progress: str,
+               target: str) -> VAResult:
+        """Tactical grounding (VA): STOP or a bbox of the current target."""
+        h, w = rgb.shape[:2]
+        text = tactical_prompt(instruction, progress, target, w, h)
+        try:
+            return parse_va_output(self._chat(text, [rgb]), w, h)
+        except Exception:            # no reply -> no bbox; caller uses center
+            return VAResult("NAVIGATE", None)
