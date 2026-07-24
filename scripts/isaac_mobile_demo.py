@@ -359,13 +359,15 @@ def _current_goal():
 _mode = {"scan_until": 0.0, "slow_until": 0.0, "ask_until": 0.0,
          "invest": None, "invest_until": 0.0}
 
-# LaViRA-mode cycle state (LA -> turn -> VA -> drive -> LA ...).
-_lav = {"state": "panorama",   # panorama|la_wait|turn|va_wait|drive
-        "pano": [],            # captured views, VIEW_ORDER order
+# LaViRA-mode cycle state, single-call variant (plan -> drive -> plan ...).
+_lav = {"state": "panorama",   # panorama|la_wait|drive
+        "pano": [],            # per view: {rgb, depth, pose} in VIEW_ORDER
         "start_yaw": 0.0, "started": False,
         "todo": "", "steps": [],   # markdown TODO + Step-i history (upstream)
-        "progress": "", "turn_to": 0.0,
-        "landmark": "", "drive_since": 0.0}
+        "progress": "", "drive_since": 0.0,
+        "prev_pano_pose": None,    # pose at the previous panorama (odometry
+        "last_sub": None,          # continuity for the ORIENTATION line)
+        "last_target": ""}
 
 
 def _wrap_pi(a: float) -> float:
@@ -480,60 +482,44 @@ def _perception_worker():
             if "labels" in frame:
                 gt_segmenter.update(frame["labels"], frame["id_to_name"])
             if frame.get("job") == "la":
-                # LaViRA strategic layer. First cycle: generate the initial
-                # TODO checklist from the starting panorama (one-shot,
-                # upstream flow), then the strategic decision reuses it.
-                todo = frame["la_todo"]
-                if not todo:
-                    todo = la_client.initial_todo(frame["pano"],
-                                                  frame["la_mission"])
-                    print(f"[la] initial TODO:\n{todo}")
-                res = la_client.decide(frame["pano"], frame["la_mission"],
-                                       todo, frame["la_steps"])
-                _state["la_result"] = res
+                # LaViRA single-call cycle: one plan query does TODO update
+                # + view choice + bbox; the subgoal is grounded from the
+                # STORED depth/pose of the chosen view. Always yields a
+                # goal (no bbox -> view center; no depth -> 1 m along the
+                # view direction): the robot moves every cycle, the CBF
+                # owns collision safety.
+                from core_safety.reasoning.lavira import (VIEW_ORDER,
+                                                          nav_pixel,
+                                                          pixel_to_goal)
+                views = [p["rgb"] for p in frame["pano"]]
+                res = la_client.plan(views, frame["la_mission"],
+                                     frame["la_todo"], frame["la_steps"],
+                                     frame["la_orient"])
+                chosen = frame["pano"][VIEW_ORDER.index(res.view)]
+                h_i, w_i = chosen["rgb"].shape[:2]
+                u, v = nav_pixel(res.bbox_px, w_i, h_i)
+                g = pixel_to_goal(u, v, chosen["depth"], pipeline.camera,
+                                  chosen["pose"])
+                _state["lav_plan"] = {
+                    "action": res.action, "view": res.view,
+                    "target": res.target, "todo": res.updated_todo,
+                    "progress": res.progress_analysis,
+                    "subgoal": (float(g[0]), float(g[1]))}
                 print(f"[la] {_time.time()-t0:.1f}s action={res.action} "
-                      f"dir={res.direction} landmark='{res.expected_landmark}'"
-                      f" ok={res.ok} — {res.reasoning}")
+                      f"view={res.view} target='{res.target}' "
+                      f"bbox={res.bbox_px} px=({u},{v}) "
+                      f"goal=({g[0]:+.2f},{g[1]:+.2f}) ok={res.ok} — "
+                      f"{res.reasoning}")
                 if res.updated_todo:
                     print(f"[la] TODO:\n{res.updated_todo}")
-                for i, v in enumerate(frame["pano"]):
-                    cv2.imwrite(str(DEBUG_DIR /
-                                    f"{_time.strftime('%H%M%S')}_pano{i}.png"),
-                                np.ascontiguousarray(v[:, :, ::-1]))
-            elif frame.get("job") == "va_sub":
-                # LaViRA tactical layer: STOP, or a bbox -> nav pixel ->
-                # world goal. Always yields a goal (bbox missing -> image
-                # center; depth missing -> 1 m ahead): upstream behaviour,
-                # the robot moves every cycle and the CBF owns safety.
-                from core_safety.reasoning.lavira import (nav_pixel,
-                                                          pixel_to_goal)
-                res = la_client.locate(frame["rgb"], frame["va_mission"],
-                                       frame["va_progress"],
-                                       frame["va_target"])
-                _state["va_reason"] = res.visual_check or res.stop_reasoning
-                if res.action == "STOP":
-                    _state["va_goal"] = "STOP"
-                    print(f"[va] {_time.time()-t0:.1f}s STOP — "
-                          f"{res.stop_reasoning}")
-                else:
-                    h_i, w_i = frame["rgb"].shape[:2]
-                    u, v = nav_pixel(res.bbox_px, w_i, h_i)
-                    g = pixel_to_goal(u, v, frame["depth"],
-                                      pipeline.camera, frame["pose"])
-                    _state["va_goal"] = (float(g[0]), float(g[1]))
-                    _state["va_step"] = {"description": frame["va_progress"],
-                                         "target": res.target
-                                         or frame["va_target"]}
-                    print(f"[va] {_time.time()-t0:.1f}s "
-                          f"'{frame['va_target']}' bbox={res.bbox_px} "
-                          f"px=({u},{v}) goal=({g[0]:+.2f},{g[1]:+.2f}) — "
-                          f"{res.visual_check}")
-                if res.bbox_px is not None:
-                    x1, y1, x2, y2 = res.bbox_px
-                    ov = np.ascontiguousarray(frame["rgb"][:, :, ::-1]).copy()
-                    cv2.rectangle(ov, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    cv2.imwrite(str(
-                        DEBUG_DIR / f"{_time.strftime('%H%M%S')}_va.png"), ov)
+                ts = _time.strftime('%H%M%S')
+                for i, p in enumerate(frame["pano"]):
+                    img = np.ascontiguousarray(p["rgb"][:, :, ::-1]).copy()
+                    if VIEW_ORDER[i] == res.view and res.bbox_px is not None:
+                        x1, y1, x2, y2 = res.bbox_px
+                        cv2.rectangle(img, (x1, y1), (x2, y2),
+                                      (0, 255, 0), 2)
+                    cv2.imwrite(str(DEBUG_DIR / f"{ts}_pano{i}.png"), img)
             elif frame.get("job") == "ground":
                 pipeline.update_grounding(frame["rgb"], frame["depth"],
                                           frame["pose"])
@@ -602,32 +588,51 @@ threading.Thread(target=_perception_worker, daemon=True).start()
 def _lavira_tick(u_nom, now):
     """One 60 Hz tick of the LaViRA cycle; returns the nominal command.
 
-    panorama: rotate in place, capturing 4 views at 90-deg increments
-    la_wait / va_wait: hold still while the worker runs the LA / VA query
-    turn: face the LA-chosen direction, then submit the VA query
+    panorama: rotate in place, capturing 4 views (rgb+depth+pose each)
+    la_wait: hold still while the worker runs the ONE plan call
+             (TODO update + view choice + bbox, grounded from the stored
+             frame of the chosen view — no re-turn, no second call)
     drive: pass through the caller's A*/waypoint command to the subgoal
 
     Rotation is translation-free (safe even before the first barrier);
     every returned command still goes through the CBF filter downstream.
     """
-    from core_safety.reasoning.lavira import DIRECTIONS, VIEW_ORDER
+    from core_safety.reasoning.lavira import (VIEW_ORDER, orientation_text,
+                                              relative_sector)
     st = _lav["state"]
     yaw = base.state[2]
+    # Ask the perception scheduler to leave the worker free for us while a
+    # finished panorama is waiting to be submitted.
+    _state["lav_wants"] = (st == "panorama"
+                           and len(_lav["pano"]) >= len(VIEW_ORDER))
 
     if st == "panorama":
         if not _lav["started"]:
             _lav.update(started=True, start_yaw=yaw, pano=[])
             print("[lavira] panorama scan...")
         k = len(_lav["pano"])
-        if k >= len(VIEW_ORDER):          # all views captured -> submit LA
+        if k >= len(VIEW_ORDER):          # all views captured -> submit plan
             if not _busy.is_set():
                 mission = args.mission or f"find and reach: {args.target}"
+                pose_now = base.state.copy()
+                if _lav["prev_pano_pose"] is None or _lav["last_sub"] is None:
+                    orient = orientation_text(0.0, "", None)
+                else:
+                    moved = float(np.linalg.norm(
+                        pose_now[:2] - _lav["prev_pano_pose"][:2]))
+                    sub_xy, sub_name = _lav["last_sub"]
+                    bearing = (np.arctan2(sub_xy[1] - pose_now[1],
+                                          sub_xy[0] - pose_now[0]) - yaw)
+                    orient = orientation_text(moved, sub_name,
+                                              relative_sector(bearing))
+                _lav["prev_pano_pose"] = pose_now
                 with _lock:
                     _latest.clear()
                     _latest.update(job="la", pano=list(_lav["pano"]),
                                    la_mission=mission,
                                    la_todo=_lav["todo"],
-                                   la_steps=list(_lav["steps"]))
+                                   la_steps=list(_lav["steps"]),
+                                   la_orient=orient)
                 _busy.set()
                 _lav["state"] = "la_wait"
             return np.zeros(3)
@@ -635,64 +640,35 @@ def _lavira_tick(u_nom, now):
         if abs(_wrap_pi(yaw - want)) < 0.06:
             g = _grab_rgbd()
             if g is not None:
-                _lav["pano"].append(g[0])
+                _lav["pano"].append({"rgb": g[0], "depth": g[1],
+                                     "pose": base.state.copy()})
             return np.zeros(3)            # hold still until this view grabbed
         return np.array([0.0, 0.0, 0.5])
 
     if st == "la_wait":
-        if "la_result" not in _state:
-            if not _busy.is_set():        # worker errored: LA never answered
+        if "lav_plan" not in _state:
+            if not _busy.is_set():        # worker errored: plan never came
                 _lav.update(state="panorama", started=False)
             return np.zeros(3)
-        res = _state.pop("la_result")
-        _lav["todo"] = res.updated_todo or _lav["todo"]
-        _lav["progress"] = res.progress_analysis
-        if res.action == "STOP":
+        plan = _state.pop("lav_plan")
+        _lav["todo"] = plan["todo"] or _lav["todo"]
+        _lav["progress"] = plan["progress"]
+        if plan["action"] == "STOP":
             _state["mission_done"] = True
             return np.zeros(3)
-        _lav["landmark"] = (res.expected_landmark or args.target
-                           or args.mission)
-        _lav["turn_to"] = _wrap_pi(_lav["start_yaw"]
-                                   + DIRECTIONS[res.direction])
-        _lav["state"] = "turn"
-        return np.zeros(3)
-
-    if st == "turn":
-        err = _wrap_pi(_lav["turn_to"] - yaw)
-        if abs(err) > 0.09:
-            return np.array([0.0, 0.0,
-                             float(np.clip(2.0 * err, -1.0, 1.0))])
-        if not _busy.is_set():
-            g = _grab_rgbd()
-            if g is not None:
-                mission = args.mission or f"find and reach: {args.target}"
-                with _lock:
-                    _latest.clear()
-                    _latest.update(job="va_sub", rgb=g[0], depth=g[1],
-                                   pose=base.state.copy(),
-                                   va_mission=mission,
-                                   va_progress=_lav["progress"],
-                                   va_target=_lav["landmark"])
-                _busy.set()
-                _lav["state"] = "va_wait"
-        return np.zeros(3)
-
-    if st == "va_wait":
-        if "va_goal" not in _state:
-            if not _busy.is_set():        # worker errored: re-ask the VA
-                _lav["state"] = "turn"
-            return np.zeros(3)
-        sub = _state.pop("va_goal")
-        if sub == "STOP":                 # VA declares the target reached
-            _state["mission_done"] = True
-            return np.zeros(3)
-        step_rec = _state.pop("va_step", None)
-        if step_rec is not None:          # upstream Step-i history entry
-            _lav["steps"].append(step_rec)
-            _lav["steps"] = _lav["steps"][-10:]
-        _state["goal"] = sub
+        # Upstream Step-i history entry, plus the chosen direction so the
+        # next cycle knows what was attempted.
+        _lav["steps"].append({"description": plan["progress"] or "moving",
+                              "target": f"went {plan['view']} toward "
+                                        f"'{plan['target']}'"})
+        _lav["steps"] = _lav["steps"][-10:]
+        _lav["last_sub"] = (np.asarray(plan["subgoal"]), plan["target"])
+        _lav["last_target"] = f"{plan['view']}: {plan['target']}"
+        _state["goal"] = plan["subgoal"]
         _lav.update(state="drive", drive_since=now)
-        print(f"[lavira] driving to subgoal ({sub[0]:+.2f},{sub[1]:+.2f})")
+        print(f"[lavira] driving to subgoal "
+              f"({plan['subgoal'][0]:+.2f},{plan['subgoal'][1]:+.2f}) "
+              f"[{plan['view']}] '{plan['target']}'")
         return u_nom
 
     # drive: the caller already computed u_nom toward _state["goal"]
@@ -723,7 +699,8 @@ try:
     if (args.frame == "ego" and step % 60 == 0
             and not _busy.is_set()):
         pipeline.costmap.recenter(base.state[0], base.state[1])
-    if step % args.perception_every == 0 and not _busy.is_set():
+    if (step % args.perception_every == 0 and not _busy.is_set()
+            and not _state.get("lav_wants")):
         frame = camera.get_current_frame()
         rgba = frame.get("rgba")
         if rgba is None or np.asarray(rgba).size <= 1:
@@ -1025,7 +1002,9 @@ try:
             va_reason=_state.get("va_reason", ""),
             la_state=(_lav["state"] if args.reasoning == "lavira" else None),
             la_todo=(_lav["todo"][:500] if args.reasoning == "lavira"
-                     else None))
+                     else None),
+            la_target=(_lav["last_target"] if args.reasoning == "lavira"
+                       else None))
         p = telemetry.read_params()
         if "v_max" in p:
             base.v_max = nominal.v_max = float(p["v_max"])

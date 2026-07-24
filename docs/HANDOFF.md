@@ -30,28 +30,30 @@ behavior実行器: PROCEED / SLOW(v半減) / STOP_AND_SCAN(その場360°回転)
 INVESTIGATE(最寄りフロンティア=安全セルと未知の境界へ移動) / ASK_HUMAN(30秒停止+
 ダッシュボードに質問表示)。**どのbehaviorでも最終速度指令は必ずCBFを通る。**
 
-**第3モード `--reasoning lavira`(2026-07-23, Uni-LaViRA実機版の忠実ポート)**:
-LA/VA/RAの3段翻訳ループ。①パノラマ(その場回転、90°ごと4枚=FOV90°で360°タイル。
-habitat版と同じ4方向)②初回のみ初期TODO生成(パノラマ→markdownチェックリストのみ
-返す専用呼び出し)③LA(4枚+任務+TODO+「Step i: 進捗->目標物」履歴→
-progress_analysis/reasoning/updated_todo_list/action/turn_direction/
-expected_landmarkのJSON。失敗時はNAVIGATE/right/"open space"にフォールバック)
-④選択方向へ回頭⑤VA(1枚+任務+進捗+目標→NAVIGATE/STOP+bbox_2d。
-[0,1000]正規化ならピクセルに変換(max<=1000ヒューリスティック))
-⑥ナビ画素=bbox下端中央、**bboxなしなら画像中央**→深度小窓median、
-**深度なしなら正面1.0m**→世界座標サブゴール⑦A*で走行(0.3m到達/45sで①へ)。
-終了=LAのSTOP、またはVAのSTOP(到達宣言)。
-**設計原則(本家準拠): 毎サイクル必ずどこかへ動く。不確実=「動いて見直す」であり
-「停止」ではない。衝突安全はCBF層の仕事。** 2026-07-23の実走で判明した教訓:
-初期実装の幻覚ガード(visible自己申告/深度範囲棄却/接地点高さゲート/3連敗退避)は
-不確実性を全て停止に変換し「回転するが一向に進まない」を起こした→全廃した。
-(これらのガードはextendedの--target用goal_grounding.pyには残存。あちらは
-固定ゴール向けで誤接地ゴールが長時間残るため妥当。)
-プロンプトは構造・JSONキー・フォールバック値を本家と一致させ、文言のみ自前
-(CC BY-NC-SA逐語コピー回避)。LA/VAは1モデル兼任(本家のllama-server単一構成)。
-安全層(SAM3監視+占有/ゾーン地図+CBF+e-stop)は完全共有・不変、安全用VLMは
-faithfulプロンプトでイベント駆動。**ablation: lavira vs extendedが1フラグ。**
-状態機械はisaac_mobile_demoの_lavira_tick(panorama/la_wait/turn/va_wait/drive)。
+**第3モード `--reasoning lavira`(2026-07-24現在: 統合1コール版"B")**:
+①パノラマ(その場回転、90°ごと4枚。**各ビューのrgb+深度+ポーズを保存**)
+②プラン呼び出し1回(4枚+任務+markdown TODO+「Step i」履歴+ORIENTATION行→
+progress_analysis/reasoning/updated_todo_list/action(NAVIGATE|STOP)/
+view(1-4)/target/bbox_2dのJSON)③bbox下端中央(なければビュー中央)+
+**選ばれたビューの保存深度・保存ポーズ**で接地→サブゴール(回頭・再撮影・
+VA第2コールなし)④A*で走行(0.3m到達/45sで①へ)。終了=STOP。
+[0,1000]→ピクセル変換はmax<=1000ヒューリスティック(本家同様)。
+フォールバック=NAVIGATE/front/bboxなし(ビュー中央→ほぼ正面へ)。
+**設計原則: 毎サイクル必ず動く。不確実=「動いて見直す」。衝突安全はCBFの仕事。**
+経緯: v1(自作ガード過多)=回転するが一向に進まない→v2(本家忠実2コール)=動くが
+1サイクル約5分(27B num_gpu=8はほぼCPUで1コール1-2分×3コール+ワーカー取り合い)
+かつgemma3系はbboxが壊滅的(コーンが見えているのに壁パネルや天井照明を囲む実例
+=va.png参照)で明後日の方向へ→v3(現行B)=1コール化+保存フレーム接地で
+サイクル2-3倍高速化。laviraジョブ待ち中は知覚ジョブ投入を止める(lav_wants)。
+**本家にない追加(オドメトリ由来の事実のみ)**: ORIENTATION行(前回パノラマからの
+移動量+前回サブゴールの現在方位8方位)と履歴の方向記録("went left toward ...")。
+毎サイクル向きがリセットされ文脈を失う問題(実走で確認)への対処。
+プロンプト文言は自前(CC BY-NC-SA回避)、構造・キー・フォールバック値は本家準拠。
+**モデルはqwen2.5vl:7b推奨**(bbox訓練済み・4bit約5GB・GPU層を増やせる。
+gemma3系はbbox接地の訓練がなく品質がモデル律速)。
+安全層は完全共有・不変、安全用VLMはfaithfulプロンプトでイベント駆動。
+**ablation: lavira vs extendedが1フラグ。** telemetryにla_state/la_todo/la_target。
+状態機械はisaac_mobile_demoの_lavira_tick(panorama/la_wait/drive)。
 
 ## 3. 数理(勉強用)
 
