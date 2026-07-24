@@ -1,25 +1,27 @@
-"""LaViRA-mode reasoning: faithful port of the Uni-LaViRA LA/VA contract.
+"""LaViRA-mode reasoning, single-call variant ("B").
 
-Structure, JSON fields, fallbacks, and control flow mirror the upstream
-real-robot pipeline (Ding et al., arXiv:2510.19655 / 2605.27582) as closely
-as our platform allows; the prompt WORDING is our own (the upstream code is
-CC BY-NC-SA, so nothing is copied verbatim). Platform adaptations, kept
-deliberately minimal:
+Derived from the Uni-LaViRA real-robot pipeline (Ding et al.,
+arXiv:2510.19655 / 2605.27582; prompt wording our own — the upstream code
+is CC BY-NC-SA and nothing is copied verbatim). Upstream splits each cycle
+into LA (panorama -> direction) and VA (post-turn view -> bbox); with a
+mostly-CPU local model every extra call costs minutes, so this variant
+merges the cycle into ONE call:
 
-  - 4 panoramic views at 90-deg increments (the habitat variant's layout;
-    the real robot sweeps 7 views with its arms, which we cannot do) ->
-    directions are front / left / back / right.
-  - RA is our A* + CBF stack instead of iPlanner. The CBF arbitrates every
-    command; LaViRA itself ships no safety layer.
+  4 panoramic views (rgb + depth + pose stored per view)
+    -> updated markdown TODO + NAVIGATE/STOP + chosen view + bbox in it
+    -> bbox bottom-center + the STORED depth/pose of that view -> subgoal
+    -> A* + CBF drive there (no physical re-turn, no second VLM call).
 
-The key upstream property this port preserves: EVERY cycle produces a
-motion target. No bbox -> use the image center pixel; no valid depth ->
-assume 1.0 m straight ahead. Uncertainty means "move and look again",
-never "freeze". (Collision safety is the CBF's job, not the planner's.)
+Upstream properties kept: markdown TODO memory rewritten every cycle,
+"Step i" navigation history, the max<=1000 bbox normalization heuristic,
+and the always-move principle — no bbox -> view center pixel, no valid
+depth -> 1.0 m along the view direction. Collision safety is the CBF's.
 
-Memory, as upstream: a markdown TODO checklist created once from the
-starting panorama and rewritten by every strategic call, plus a
-"Step i: <progress> -> <target>" navigation history.
+Additions beyond upstream (both odometry facts, not model guesses),
+motivated by observed direction loss between slow cycles:
+  - an ORIENTATION line telling the model how far it moved and where its
+    previous subgoal now lies relative to the CURRENT heading;
+  - the chosen direction recorded in each history step.
 """
 from __future__ import annotations
 
@@ -40,26 +42,29 @@ DIRECTIONS: dict[str, float] = {
 }
 VIEW_ORDER = ("front", "left", "back", "right")
 
-_VIEW_LIST = "front(0 deg), left(+90 deg), back(180 deg), right(-90 deg)"
+_VIEW_LIST = ("1=front(0 deg), 2=left(+90 deg), 3=back(180 deg), "
+              "4=right(-90 deg)")
+
+_SECTORS = ("front", "front-left", "left", "back-left",
+            "back", "back-right", "right", "front-right")
 
 
-# --------------------------------------------------------------------------
-# Prompt builders (own wording, upstream structure)
-# --------------------------------------------------------------------------
-
-def initial_todo_prompt(instruction: str) -> str:
-    """Leading text of the one-shot initial TODO generation (before frames)."""
-    return (f'Instruction: "{instruction}"\n\n'
-            "The attached images are panoramic views from the starting "
-            f"position, in this order: {_VIEW_LIST}.")
+def relative_sector(bearing: float) -> str:
+    """Bucket an ego-relative bearing [rad] into one of 8 sector names."""
+    idx = int(np.round((bearing % (2 * np.pi)) / (np.pi / 4))) % 8
+    return _SECTORS[idx]
 
 
-def initial_todo_suffix() -> str:
-    """Trailing directive of the initial TODO generation (after frames)."""
-    return ("Write a dynamic checklist of steps to carry out the "
-            "instruction.\n"
-            "Markdown format, one item per line: - [ ] step description\n"
-            "Return ONLY the checklist, no JSON, no other text.")
+def orientation_text(moved_m: float, prev_target: str,
+                     prev_sector: str | None) -> str:
+    """Odometry-derived continuity line for the prompt (never guessed)."""
+    if prev_sector is None:
+        return ("ORIENTATION: this is the first cycle. The panorama below "
+                "is relative to your CURRENT heading.")
+    return (f"ORIENTATION: since the previous panorama you moved "
+            f"{moved_m:.1f} m. Your previous subgoal ('{prev_target}') now "
+            f"lies to your {prev_sector}. The panorama below is relative "
+            "to your CURRENT heading, not the previous one.")
 
 
 def history_text(steps: list[dict]) -> str:
@@ -74,82 +79,68 @@ def history_text(steps: list[dict]) -> str:
     return out
 
 
-def strategic_task_text(instruction: str, steps: list[dict]) -> str:
-    """Task + history text placed BEFORE the panorama frames (LA call)."""
-    return (f'Navigation Task: "{instruction}"\n\n'
-            f"History:\n{history_text(steps)}")
+def plan_prompt(instruction: str, todo: str, steps: list[dict],
+                orientation: str, width: int, height: int) -> str:
+    """The single per-cycle prompt (text part; 4 images attached)."""
+    return f"""Navigation Task: "{instruction}"
 
+{history_text(steps)}
+{orientation}
 
-def strategic_prompt(instruction: str, todo: str) -> str:
-    """Strategic decision body placed AFTER the panorama frames (LA call)."""
-    return f"""
-**ROLE**: You are the robot's strategic navigator.
+**ROLE**: You are the navigator of a mobile robot: strategy and visual
+grounding in a single step.
 **MISSION**: "{instruction}"
 
-**Current TODO List**:
-{todo}
+**Current TODO List** (create it now if empty):
+{todo or '(empty)'}
 
-**Available directions**: {_VIEW_LIST}
-(the images are attached in that order)
+The 4 attached images are a panorama from your current position, in this
+order: {_VIEW_LIST}.
 
 **Your tasks**:
-1. Update the TODO list: mark finished items [x].
-2. Pick the next action:
-   - NAVIGATE while navigation steps remain
-   - STOP once every step is finished
+1. Update the TODO list. Markdown, one item per line:
+   "- [ ] pending" / "- [x] done".
+2. Decide the action:
+   - "STOP" only when the mission is complete (you are AT the target).
+   - "NAVIGATE" otherwise.
+3. If NAVIGATE: choose the ONE image whose direction best advances the
+   mission, and put a bounding box around ONE concrete thing that is
+   ACTUALLY VISIBLE in that image for the robot to drive toward — an
+   object, a floor spot, the free floor at the edge of an obstacle row.
+   Never box an abstract idea ("the path", "beyond the wall") and never
+   box something you cannot see. If the mission target itself is visible
+   in any image, always choose it.
 
-**Reply with one JSON object** (no markdown, nothing else):
+The bbox coordinates are pixels [0..{width}, 0..{height}] in the CHOSEN
+image only.
+
+**Reply with one JSON object** (no markdown fences, nothing else):
 {{
     "progress_analysis": "...(30 words or fewer)...",
     "reasoning": "...(1-2 sentences)...",
     "updated_todo_list": "...",
     "action": "NAVIGATE" | "STOP",
-    "turn_direction": "front|left|back|right",
-    "expected_landmark": "..."
+    "view": 1 | 2 | 3 | 4,
+    "target": "the visible thing you boxed",
+    "bbox_2d": [x1, y1, x2, y2]
 }}
 """
 
-
-def tactical_prompt(instruction: str, progress: str, target: str,
-                    width: int, height: int) -> str:
-    """Tactical bbox body placed after the current-view image (VA call)."""
-    return f"""
-**ROLE**: You are the robot's tactical eyes.
-**MISSION**: "{instruction}"
-**PROGRESS**: "{progress}"
-**CURRENT TARGET**: "{target}"
-
-Find the target described above in the image.
-Coordinates are pixels in [0..{width}, 0..{height}].
-
-JSON:
-{{
-    "visual_check": "I see ...",
-    "action": "NAVIGATE" | "STOP",
-    "bbox_2d": [x1, y1, x2, y2],
-    "target": "object name",
-    "stop_reasoning": "..."
-}}
-"""
-
-
-# --------------------------------------------------------------------------
-# Output parsing (upstream fallbacks preserved)
-# --------------------------------------------------------------------------
 
 @dataclass
-class LAResult:
+class PlanResult:
     ok: bool                      # False = model/parse failure (fallback)
     action: str                   # NAVIGATE | STOP
-    direction: str                # key of DIRECTIONS
-    expected_landmark: str
+    view: str                     # key of DIRECTIONS
+    bbox_px: tuple[int, int, int, int] | None   # pixels in the chosen view
+    target: str
     updated_todo: str
     progress_analysis: str = ""
     reasoning: str = ""
 
 
 def _extract_json(text: str) -> dict | None:
-    """Fenced ```json block first, else outermost braces (upstream order)."""
+    """Fenced ```json block first, else outermost braces."""
     m = re.search(r"```(?:json)?\s*\n?((?:.|\n)*?)\s*```", text, re.DOTALL)
     raw = m.group(1) if m else None
     if raw is None:
@@ -164,50 +155,29 @@ def _extract_json(text: str) -> dict | None:
         return None
 
 
-def parse_la_output(text: str, prev_todo: str = "") -> LAResult:
-    """Parse the strategic reply; upstream fallback = NAVIGATE / right /
-    'open space' with the TODO list left unchanged."""
-    fallback = LAResult(False, "NAVIGATE", "right", "open space", prev_todo,
-                        "Fallback", "Model error")
+def _parse_view(v) -> str:
+    """Accept 1-4 (upstream-style index) or a direction name."""
+    try:
+        i = int(v)
+        if 1 <= i <= 4:
+            return VIEW_ORDER[i - 1]
+    except (TypeError, ValueError):
+        pass
+    name = str(v).strip().lower()
+    return name if name in DIRECTIONS else "front"
+
+
+def parse_plan_output(text: str, width: int, height: int,
+                      prev_todo: str = "") -> PlanResult:
+    """Parse the combined reply; degrade to NAVIGATE / front / no bbox.
+
+    The fallback still moves (view center -> ~straight ahead): uncertainty
+    means "move and look again", never "freeze"."""
+    fallback = PlanResult(False, "NAVIGATE", "front", None, "open space",
+                          prev_todo, "Fallback", "Model error")
     obj = _extract_json(text)
     if obj is None:
         return fallback
-    action = str(obj.get("action", "")).strip().upper()
-    if action not in ("NAVIGATE", "STOP"):
-        action = "NAVIGATE"
-    direction = str(obj.get("turn_direction", "")).strip().lower()
-    if direction not in DIRECTIONS:
-        direction = "right"
-    todo = str(obj.get("updated_todo_list", "")).strip() or prev_todo
-    return LAResult(
-        ok=True, action=action, direction=direction,
-        expected_landmark=str(obj.get("expected_landmark", "")).strip()
-        or "open space",
-        updated_todo=todo,
-        progress_analysis=str(obj.get("progress_analysis", "")),
-        reasoning=str(obj.get("reasoning", "")),
-    )
-
-
-@dataclass
-class VAResult:
-    action: str                          # NAVIGATE | STOP
-    bbox_px: tuple[int, int, int, int] | None
-    target: str = ""
-    stop_reasoning: str = ""
-    visual_check: str = ""
-
-
-def parse_va_output(text: str, width: int, height: int) -> VAResult:
-    """Parse the tactical reply and normalise the bbox to pixels.
-
-    Upstream heuristic kept as-is: coordinates whose maximum is <= 1000
-    are treated as Qwen-style [0, 1000]-normalized and rescaled. A missing
-    or malformed bbox is NOT an error: the caller falls back to the image
-    center (the robot still moves)."""
-    obj = _extract_json(text)
-    if obj is None:
-        return VAResult("NAVIGATE", None)
     action = str(obj.get("action", "")).strip().upper()
     if action not in ("NAVIGATE", "STOP"):
         action = "NAVIGATE"
@@ -225,14 +195,20 @@ def parse_va_output(text: str, width: int, height: int) -> VAResult:
                        int(max(0, min(height, b[3]))))
         except (TypeError, ValueError):
             bbox_px = None
-    return VAResult(action=action, bbox_px=bbox_px,
-                    target=str(obj.get("target", "")),
-                    stop_reasoning=str(obj.get("stop_reasoning", "")),
-                    visual_check=str(obj.get("visual_check", "")))
+    return PlanResult(
+        ok=True, action=action,
+        view=_parse_view(obj.get("view")),
+        bbox_px=bbox_px,
+        target=str(obj.get("target", "")).strip() or "open space",
+        updated_todo=str(obj.get("updated_todo_list", "")).strip()
+        or prev_todo,
+        progress_analysis=str(obj.get("progress_analysis", "")),
+        reasoning=str(obj.get("reasoning", "")),
+    )
 
 
 # --------------------------------------------------------------------------
-# RA grounding: nav pixel -> world goal (always succeeds, as upstream)
+# RA grounding: nav pixel -> world goal (always succeeds)
 # --------------------------------------------------------------------------
 
 def nav_pixel(bbox_px: tuple[int, int, int, int] | None,
@@ -246,13 +222,15 @@ def nav_pixel(bbox_px: tuple[int, int, int, int] | None,
 
 
 def pixel_to_goal(u: int, v: int, depth: np.ndarray | None,
-                  cam: PinholeCamera, robot_pose: np.ndarray,
+                  cam: PinholeCamera, view_pose: np.ndarray,
                   window: int = 7) -> np.ndarray:
     """Project one pixel + median window depth into a world (x, y) goal.
 
-    Never fails: with no valid depth the goal defaults to 1.0 m straight
-    ahead (upstream behaviour) — a wrong-but-moving guess beats freezing,
-    and the CBF layer owns collision safety anyway."""
+    view_pose is the robot pose AT CAPTURE TIME of the chosen view (the
+    subgoal is grounded from the stored panorama frame, not a re-capture).
+    Never fails: with no valid depth the goal defaults to 1.0 m along the
+    view direction — a wrong-but-moving guess beats freezing; the CBF
+    layer owns collision safety."""
     d = None
     if depth is not None and depth.size:
         h, w = depth.shape[:2]
@@ -264,7 +242,7 @@ def pixel_to_goal(u: int, v: int, depth: np.ndarray | None,
         finite = patch[np.isfinite(patch) & (patch > 0)]
         if finite.size:
             d = float(np.median(finite))
-    x, y, th = robot_pose
+    x, y, th = view_pose
     fwd = np.array([np.cos(th), np.sin(th)])
     if d is None:
         return np.array([x, y]) + 1.0 * fwd
@@ -274,7 +252,7 @@ def pixel_to_goal(u: int, v: int, depth: np.ndarray | None,
 
 
 # --------------------------------------------------------------------------
-# Ollama client (LA + VA share one model, as upstream's llama-server)
+# Ollama client
 # --------------------------------------------------------------------------
 
 class OllamaLaViRA:
@@ -287,50 +265,33 @@ class OllamaLaViRA:
         self.num_gpu = num_gpu
         self.last_raw: str | None = None
 
-    def _chat(self, text: str, images: list[np.ndarray],
-              temperature: float = 0.0) -> str:
+    def plan(self, views: list[np.ndarray], instruction: str, todo: str,
+             steps: list[dict], orientation: str) -> PlanResult:
+        """One combined LA+VA decision from the 4 panorama views."""
         import requests
         from .vlm_client import OllamaVLM
-        options: dict = {"temperature": temperature}
+        h, w = views[0].shape[:2]
+        options: dict = {"temperature": 0.0}
         if self.num_gpu is not None:
             options["num_gpu"] = self.num_gpu
         payload = {
             "model": self.model,
             "stream": False,
             "options": options,
-            "messages": [{"role": "user", "content": text,
-                          "images": [OllamaVLM._encode_image(i)
-                                     for i in images]}],
+            "messages": [{"role": "user",
+                          "content": plan_prompt(instruction, todo, steps,
+                                                 orientation, w, h),
+                          "images": [OllamaVLM._encode_image(v)
+                                     for v in views]}],
         }
-        r = requests.post(f"{self.host}/api/chat", json=payload,
-                          timeout=self.timeout)
-        if r.status_code >= 400:
-            raise RuntimeError(f"Ollama HTTP {r.status_code}: {r.text[:300]}")
-        self.last_raw = r.json()["message"]["content"]
-        return self.last_raw
-
-    def initial_todo(self, views: list[np.ndarray], instruction: str) -> str:
-        """One-shot initial checklist from the starting panorama."""
-        text = (initial_todo_prompt(instruction) + "\n\n"
-                + initial_todo_suffix())
-        return self._chat(text, views, temperature=0.1).strip()
-
-    def decide(self, views: list[np.ndarray], instruction: str,
-               todo: str, steps: list[dict]) -> LAResult:
-        """Strategic decision (LA): direction / STOP + TODO rewrite."""
-        text = (strategic_task_text(instruction, steps) + "\n"
-                + strategic_prompt(instruction, todo))
         try:
-            return parse_la_output(self._chat(text, views), prev_todo=todo)
-        except Exception:            # network/model error -> upstream fallback
-            return parse_la_output("", prev_todo=todo)
-
-    def locate(self, rgb: np.ndarray, instruction: str, progress: str,
-               target: str) -> VAResult:
-        """Tactical grounding (VA): STOP or a bbox of the current target."""
-        h, w = rgb.shape[:2]
-        text = tactical_prompt(instruction, progress, target, w, h)
-        try:
-            return parse_va_output(self._chat(text, [rgb]), w, h)
-        except Exception:            # no reply -> no bbox; caller uses center
-            return VAResult("NAVIGATE", None)
+            r = requests.post(f"{self.host}/api/chat", json=payload,
+                              timeout=self.timeout)
+            if r.status_code >= 400:
+                raise RuntimeError(
+                    f"Ollama HTTP {r.status_code}: {r.text[:300]}")
+            self.last_raw = r.json()["message"]["content"]
+            return parse_plan_output(self.last_raw, w, h, prev_todo=todo)
+        except Exception as e:        # network/model error -> keep moving
+            print(f"[lavira] plan call failed: {e}")
+            return parse_plan_output("", w, h, prev_todo=todo)
